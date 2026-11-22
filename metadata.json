@@ -1,0 +1,6 @@
+{
+  "name": "FolioPDF — Client-Side PDF Workstation",
+  "description": "Run 25 PDF tools locally in your browser with parallel tabs, zero file size limits, and GitHub Pages static hosting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
