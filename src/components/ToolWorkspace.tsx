@@ -368,8 +368,8 @@ export function ToolWorkspace({
           accept={tool.accept}
           multiple={false}
           compact
-          label="Drop a saved .html or .md file (optional — or edit markup below)"
-          helperText="No size limit · Converts markup directly to vector PDF locally"
+          label="Drop a saved .html or .md file (optional — or enter a webpage link / edit markup below)"
+          helperText="No size limit · Supports live URLs, uploaded .html / .md files, and pasted markup"
           onFilesSelected={handleFilesSelected}
         />
       )}
@@ -425,6 +425,7 @@ export function ToolWorkspace({
               file={files[0]}
               processing={processing}
               onRunTask={handleRunTask}
+              onMultiplierChange={setExtraMultiplier}
             />
           )}
 

@@ -47,6 +47,7 @@ export function buildDeviceProfile(params: {
 
   // Estimate safe peak working memory for browser JS/WASM/Canvas allocations.
   // Browsers typically crash a single renderer tab well below total system RAM.
+  // Note: Chromium caps navigator.deviceMemory at 8 GB for anti-fingerprinting even on 16–64 GB PCs.
   let estimatedSafeBudgetBytes: number;
   if (deviceMemoryGb !== null) {
     if (isMobile) {
@@ -54,10 +55,11 @@ export function buildDeviceProfile(params: {
       estimatedSafeBudgetBytes = Math.min(deviceMemoryGb * 0.14 * GB, 650 * MB);
     } else if (deviceMemoryGb <= 4) {
       estimatedSafeBudgetBytes = 700 * MB;
-    } else if (deviceMemoryGb <= 8) {
-      estimatedSafeBudgetBytes = 1.4 * GB;
+    } else if (deviceMemoryGb <= 8 && hardwareConcurrency < 12) {
+      estimatedSafeBudgetBytes = 1.5 * GB;
     } else {
-      estimatedSafeBudgetBytes = 2.2 * GB;
+      // 16GB+ / high-core desktop browser (64-bit V8/Gecko tab headroom)
+      estimatedSafeBudgetBytes = 2.4 * GB;
     }
   } else {
     // Firefox/Safari don't expose navigator.deviceMemory; infer conservatively from mobile/cores
@@ -65,13 +67,15 @@ export function buildDeviceProfile(params: {
       estimatedSafeBudgetBytes = 420 * MB;
     } else if (hardwareConcurrency <= 4) {
       estimatedSafeBudgetBytes = 900 * MB;
+    } else if (hardwareConcurrency >= 12) {
+      estimatedSafeBudgetBytes = 2.2 * GB;
     } else {
       estimatedSafeBudgetBytes = 1.5 * GB;
     }
   }
 
   if (jsHeapLimitBytes !== null && jsHeapLimitBytes > 0) {
-    // Stay below ~60% of reported JS heap ceiling (ArrayBuffers + canvas count alongside heap)
+    // Stay below ~65% of reported JS heap ceiling (ArrayBuffers + canvas count alongside heap)
     estimatedSafeBudgetBytes = Math.min(estimatedSafeBudgetBytes, jsHeapLimitBytes * 0.65);
   }
 
@@ -242,9 +246,17 @@ export async function probeBrowserFile(file: File): Promise<FileHeaderProbe> {
   );
 }
 
+export function formatComputeDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 1) return '<1s';
+  if (seconds < 60) return `~${Math.round(seconds)}s`;
+  const mins = seconds / 60;
+  if (mins < 10) return `~${mins.toFixed(1)} min`;
+  return `~${Math.round(mins)} min`;
+}
+
 /**
  * Pure deterministic evaluator combining file header probes, tool memory multiplier,
- * cumulative parallel-tab load, and device hardware capability.
+ * CPU compute weight, cumulative parallel-tab load, and device hardware capability.
  * Always produces an advisory risk sign—never imposes a hard file size cap.
  */
 export function assessWorkloadRisk(input: {
@@ -322,43 +334,90 @@ export function assessWorkloadRisk(input: {
   }
 
   // Estimate peak RAM usage:
-  // current files * tool multiplier * extraMultiplier (e.g. high DPI) + baseline overhead of other open tabs
+  // current files * tool multiplier * extraMultiplier (e.g. high DPI / deep scrub) + baseline overhead of other open tabs
   const effectiveMultiplier = tool.memoryMultiplier * extraMultiplier;
   const currentWorkPeak = totalInputBytes * effectiveMultiplier;
   const otherTabsOverhead = otherTabsBytes * 1.6;
   const estimatedPeakBytes = Math.round(currentWorkPeak + otherTabsOverhead);
   const ratio = device.estimatedSafeBudgetBytes > 0 ? estimatedPeakBytes / device.estimatedSafeBudgetBytes : 0;
 
-  // Browser ArrayBuffer hard ceiling warning (>1.8GB single file often exceeds V8/WebKit ArrayBuffer allocation)
+  // Estimate CPU compute duration calibrated to file size, task computeWeight, mode multiplier, and device threads
+  const baseComputeWeight = tool.computeWeight ?? (tool.memoryMultiplier >= 6 ? 3.5 : 0.8);
+  const sizeMb = Math.max(0.1, totalInputBytes / MB);
+  const cpuSpeedFactor = device.isMobile
+    ? 0.55
+    : Math.min(2.4, Math.max(0.8, device.hardwareConcurrency / 6));
+  const estimatedComputeSeconds = Math.max(
+    0.2,
+    ((sizeMb / 10) * baseComputeWeight * Math.max(0.4, extraMultiplier)) / cpuSpeedFactor,
+  );
+
+  const computeTier =
+    estimatedComputeSeconds >= 45
+      ? 'extreme'
+      : estimatedComputeSeconds >= 12
+        ? 'heavy'
+        : estimatedComputeSeconds >= 2.5
+          ? 'moderate'
+          : 'light';
+
+  const tierTitle =
+    computeTier === 'extreme'
+      ? 'Extreme CPU'
+      : computeTier === 'heavy'
+        ? 'Heavy CPU'
+        : computeTier === 'moderate'
+          ? 'Moderate CPU'
+          : 'Light CPU';
+  const computeLabel = `${tierTitle} · ${formatComputeDuration(estimatedComputeSeconds)}`;
+
+  // Browser ArrayBuffer hard ceiling warning (>1.5GB single file often exceeds V8/WebKit ArrayBuffer allocation)
   const hasHugeSingleFile = probes.some((p) => p.sizeBytes >= 1.5 * GB);
 
-  if (hasHugeSingleFile || ratio >= 0.85) {
+  if (hasHugeSingleFile || ratio >= 1.35) {
     issues.push({
-      id: 'device-crash-risk',
-      severity: 'high-risk',
-      title: 'High browser crash risk on this device',
-      detail: `Estimated peak memory (${formatBytes(estimatedPeakBytes)}) approaches or exceeds this device's safe browser tab budget (${formatBytes(device.estimatedSafeBudgetBytes)}). No upload limit is enforced, so you may still try—but the tab could freeze or crash out of memory.`,
+      id: 'near-guaranteed-crash',
+      severity: 'crash-imminent',
+      title: 'Near-guaranteed tab crash on this device',
+      detail: `Estimated peak memory (${formatBytes(estimatedPeakBytes)}) far exceeds this browser tab's safe ceiling (${formatBytes(device.estimatedSafeBudgetBytes)}) with ${computeLabel}. Chrome/Edge/Firefox will very likely terminate this tab with Out-Of-Memory—but controls remain unlocked so you can still try it.`,
       actionHint:
         otherTabsBytes > 20 * MB
-          ? 'Close other heavy workspace tabs or split the document into smaller batches first.'
-          : 'Lower output DPI/quality if available, or process on a desktop with more RAM.',
+          ? 'Close other heavy tabs, lower DPI/mode, or split the PDF into smaller chunks first.'
+          : 'Switch to a lighter mode (e.g. Smart Image Compression or lower DPI) or split the PDF into smaller page batches.',
     });
     if (otherTabsBytes > 20 * MB) {
       tips.push(`Other open tabs are currently holding ${formatBytes(otherTabsBytes)} in memory.`);
     }
-    if (tool.memoryMultiplier >= 6) {
-      tips.push(`${tool.name} renders full pages to bitmaps, which uses ~${tool.memoryMultiplier.toFixed(1)}× the raw file size in RAM.`);
+    if (effectiveMultiplier >= 5.5) {
+      tips.push(`${tool.name} in this mode uses ~${effectiveMultiplier.toFixed(1)}× the raw file size in RAM.`);
     }
     if (device.isMobile) {
-      tips.push('Mobile browsers enforce stricter per-tab memory caps than desktop browsers.');
+      tips.push('Mobile browsers enforce strict per-tab memory caps compared to 16 GB+ desktops.');
     }
-  } else if (ratio >= 0.45) {
+  } else if (ratio >= 0.85) {
+    issues.push({
+      id: 'device-crash-risk',
+      severity: 'high-risk',
+      title: 'High browser crash risk on this device',
+      detail: `Estimated peak memory (${formatBytes(estimatedPeakBytes)}) approaches this device's safe browser tab budget (${formatBytes(device.estimatedSafeBudgetBytes)}) with ${computeLabel}. No upload limit is enforced, so you may still run it—but the tab could freeze or crash.`,
+      actionHint:
+        otherTabsBytes > 20 * MB
+          ? 'Close other heavy workspace tabs or split the document into smaller batches first.'
+          : 'Lower output DPI/quality if available, or close unused browser tabs to free RAM.',
+    });
+    if (otherTabsBytes > 20 * MB) {
+      tips.push(`Other open tabs are currently holding ${formatBytes(otherTabsBytes)} in memory.`);
+    }
+    if (effectiveMultiplier >= 5.5) {
+      tips.push(`${tool.name} renders/decodes heavy bitmaps (~${effectiveMultiplier.toFixed(1)}× raw file size in RAM).`);
+    }
+  } else if (ratio >= 0.45 || estimatedComputeSeconds >= 15) {
     issues.push({
       id: 'device-slowdown-caution',
       severity: 'caution',
-      title: 'Heavy workload for this device — processing may be slow',
-      detail: `Estimated peak memory is ${formatBytes(estimatedPeakBytes)} against ~${formatBytes(device.estimatedSafeBudgetBytes)} safe tab headroom. Processing remains unrestricted and will run locally.`,
-      actionHint: 'Avoid running multiple raster/OCR jobs at the exact same time.',
+      title: 'Heavy workload — compilation may take a moment',
+      detail: `Estimated peak memory is ${formatBytes(estimatedPeakBytes)} against ~${formatBytes(device.estimatedSafeBudgetBytes)} safe tab headroom (${computeLabel}). Processing remains unrestricted and will run locally on your CPU.`,
+      actionHint: 'Avoid running multiple heavy raster/OCR jobs simultaneously while this compiles.',
     });
     if (otherTabsBytes > 20 * MB) {
       tips.push(`Other open tabs currently hold ${formatBytes(otherTabsBytes)}.`);
@@ -368,6 +427,8 @@ export function assessWorkloadRisk(input: {
   let level: PreflightSeverity = 'ok';
   if (issues.some((i) => i.severity === 'unprocessable')) {
     level = 'unprocessable';
+  } else if (issues.some((i) => i.severity === 'crash-imminent')) {
+    level = 'crash-imminent';
   } else if (issues.some((i) => i.severity === 'high-risk')) {
     level = 'high-risk';
   } else if (issues.some((i) => i.severity === 'caution')) {
@@ -376,10 +437,12 @@ export function assessWorkloadRisk(input: {
 
   const ramLabel =
     device.deviceMemoryGb !== null
-      ? `~${device.deviceMemoryGb} GB RAM`
-      : `${device.hardwareConcurrency} CPU threads`;
+      ? device.deviceMemoryGb >= 8 && !device.isMobile && device.hardwareConcurrency >= 12
+        ? '8+ GB RAM'
+        : `~${device.deviceMemoryGb} GB RAM`
+      : `${device.hardwareConcurrency} threads`;
   const classLabel = device.isMobile ? 'Mobile browser' : 'Desktop browser';
-  const deviceSummary = `${classLabel} · ${ramLabel} · Safe tab budget ~${formatBytes(device.estimatedSafeBudgetBytes)}`;
+  const deviceSummary = `${classLabel} · ${ramLabel} · ${device.hardwareConcurrency} CPU threads · Safe tab budget ~${formatBytes(device.estimatedSafeBudgetBytes)}`;
 
   return {
     level,
@@ -388,6 +451,9 @@ export function assessWorkloadRisk(input: {
     deviceBudgetBytes: device.estimatedSafeBudgetBytes,
     totalInputBytes,
     otherTabsBytes,
+    estimatedComputeSeconds,
+    computeTier,
+    computeLabel,
     deviceSummary,
     tips,
   };

@@ -1,16 +1,18 @@
-import { ArrowDown, ArrowUp, Loader2, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { AlertCircle, ArrowDown, ArrowUp, Download, Globe, Loader2, Plus, Trash2, X } from 'lucide-react';
+import { useEffect, useId, useState } from 'react';
 import { runPdfOcr } from '../../engine/ocrEngine';
 import {
   convertWithPdfConverter,
   createPdfFromComposerBlocks,
   extractEmbeddedImages,
+  fetchWebpageFromUrl,
   imagesToPdf,
   pdfToImages,
   webpageHtmlToPdf,
+  webpageUrlToPdf,
 } from '../../engine/pdfOperations';
 import type { CreatePdfBlock, ToolResult } from '../../types/tools';
-import { formatBytes } from '../../utils/pdfUtils';
+import { formatBytes, sanitizeBaseName } from '../../utils/pdfUtils';
 
 interface ConverterAndImagesToolProps {
   toolId:
@@ -106,6 +108,13 @@ export function ConverterAndImagesTool({
   }, [toolId, exportDpi, onMultiplierChange]);
 
   // Webpage / HTML to PDF state
+  const webUrlInputId = useId();
+  const webPageSizeId = useId();
+  const webTextareaId = useId();
+  const [webpageUrl, setWebpageUrl] = useState('');
+  const [fetchingUrl, setFetchingUrl] = useState(false);
+  const [fetchUrlError, setFetchUrlError] = useState<string | null>(null);
+  const [fetchedMeta, setFetchedMeta] = useState<{ title: string; sourceUrl: string } | null>(null);
   const [markupMode, setMarkupMode] = useState<'html' | 'markdown'>('html');
   const [markupSource, setMarkupSource] = useState(DEFAULT_HTML_SAMPLE);
   const [webPageSize, setWebPageSize] = useState<'a4' | 'letter'>('a4');
@@ -116,6 +125,8 @@ export function ConverterAndImagesTool({
     const f = files[0];
     const isMd = f.name.toLowerCase().endsWith('.md');
     setMarkupMode(isMd ? 'markdown' : 'html');
+    setFetchedMeta(null);
+    setFetchUrlError(null);
     f.text().then((txt) => setMarkupSource(txt)).catch(() => {});
   }, [toolId, files]);
 
@@ -434,65 +445,223 @@ export function ConverterAndImagesTool({
   }
 
   if (toolId === 'webpage-to-pdf') {
+    const handleConvertLink = () => {
+      setFetchUrlError(null);
+      void onRunTask((setProgress) => webpageUrlToPdf(webpageUrl, webPageSize, setProgress));
+    };
+
+    const handleFetchIntoEditor = async () => {
+      setFetchUrlError(null);
+      setFetchingUrl(true);
+      try {
+        const fetched = await fetchWebpageFromUrl(webpageUrl);
+        onFilesChange([]);
+        setMarkupMode(fetched.mode);
+        setMarkupSource(fetched.content);
+        setFetchedMeta({ title: fetched.title, sourceUrl: fetched.sourceUrl });
+      } catch (err) {
+        setFetchUrlError(err instanceof Error ? err.message : 'Unable to fetch webpage.');
+      } finally {
+        setFetchingUrl(false);
+      }
+    };
+
+    const activeUploadedFile = files[0] ?? null;
+
     return (
-      <div className="rounded-xl bg-white dark:bg-[#131C31] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-slate-800">
-            {(['html', 'markdown'] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMarkupMode(m)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium uppercase cursor-pointer ${
-                  markupMode === m
-                    ? 'bg-white dark:bg-[#131C31] text-slate-900 dark:text-white shadow-xs'
-                    : 'text-slate-600 dark:text-slate-400'
-                }`}
+      <div className="space-y-4">
+        {/* Section 1: Convert directly from a live Webpage Link (URL) */}
+        <div className="rounded-xl bg-white dark:bg-[#131C31] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-lg bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
+                <Globe className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
+                  Convert from Webpage Link
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Paste any public webpage URL to extract readable content and export a vector PDF.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label htmlFor={webPageSizeId} className="text-xs text-slate-600 dark:text-slate-400">
+                Page size:
+              </label>
+              <select
+                id={webPageSizeId}
+                value={webPageSize}
+                onChange={(e) => setWebPageSize(e.target.value as 'a4' | 'letter')}
+                className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs text-slate-800 dark:text-slate-200"
               >
-                {m}
+                <option value="a4">A4</option>
+                <option value="letter">US Letter</option>
+              </select>
+            </div>
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!processing && !fetchingUrl && webpageUrl.trim()) {
+                handleConvertLink();
+              }
+            }}
+            className="flex flex-col sm:flex-row gap-2.5"
+          >
+            <label htmlFor={webUrlInputId} className="sr-only">
+              Webpage URL
+            </label>
+            <input
+              id={webUrlInputId}
+              type="text"
+              inputMode="url"
+              value={webpageUrl}
+              onChange={(e) => {
+                setWebpageUrl(e.target.value);
+                if (fetchUrlError) setFetchUrlError(null);
+              }}
+              placeholder="https://example.com or en.wikipedia.org/wiki/PDF"
+              className="flex-1 h-10 px-3.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-500/40"
+            />
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={processing || fetchingUrl || !webpageUrl.trim()}
+                onClick={() => void handleFetchIntoEditor()}
+                className="h-10 px-3.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 text-xs font-medium text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                title="Fetch page content into the editor below so you can review or edit before exporting"
+              >
+                {fetchingUrl ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                <span>Fetch to Editor</span>
+              </button>
+              <button
+                type="submit"
+                disabled={processing || fetchingUrl || !webpageUrl.trim()}
+                className="h-10 px-4 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center gap-2 cursor-pointer"
+              >
+                {processing && <Loader2 className="w-4 h-4 animate-spin" />}
+                <span>Convert Link to PDF</span>
+              </button>
+            </div>
+          </form>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+            <span>Try a sample link:</span>
+            {[
+              { label: 'example.com', url: 'https://example.com' },
+              { label: 'Wikipedia: PDF', url: 'https://en.wikipedia.org/wiki/PDF' },
+            ].map((sample) => (
+              <button
+                key={sample.url}
+                type="button"
+                onClick={() => {
+                  setWebpageUrl(sample.url);
+                  setFetchUrlError(null);
+                }}
+                className="px-2 py-0.5 rounded-md border border-slate-200 dark:border-slate-700 hover:border-rose-400 dark:hover:border-rose-500/60 hover:text-rose-600 dark:hover:text-rose-400 transition-colors cursor-pointer"
+              >
+                {sample.label}
               </button>
             ))}
           </div>
 
-          <div className="flex items-center gap-2">
-            <label htmlFor="web-page-size" className="text-xs text-slate-600 dark:text-slate-400">
-              Page size:
-            </label>
-            <select
-              id="web-page-size"
-              value={webPageSize}
-              onChange={(e) => setWebPageSize(e.target.value as 'a4' | 'letter')}
-              className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs"
-            >
-              <option value="a4">A4</option>
-              <option value="letter">US Letter</option>
-            </select>
+          {fetchUrlError && (
+            <div className="rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/70 px-3.5 py-2.5 flex items-start gap-2.5 text-xs text-rose-700 dark:text-rose-300">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span className="flex-1">{fetchUrlError}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Section 2: Convert from Uploaded File or Edited HTML/Markdown Markup */}
+        <div className="rounded-xl bg-white dark:bg-[#131C31] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-1 p-1 rounded-lg bg-slate-100 dark:bg-slate-800">
+              {(['html', 'markdown'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setMarkupMode(m)}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium uppercase cursor-pointer ${
+                    markupMode === m
+                      ? 'bg-white dark:bg-[#131C31] text-slate-900 dark:text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+
+            {activeUploadedFile && (
+              <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs text-slate-700 dark:text-slate-300">
+                <span className="truncate max-w-[220px]">Loaded file: {activeUploadedFile.name}</span>
+                <button
+                  type="button"
+                  onClick={() => onFilesChange([])}
+                  className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                  aria-label="Clear uploaded file"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {!activeUploadedFile && fetchedMeta && (
+              <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-xs text-emerald-700 dark:text-emerald-300">
+                <span className="truncate max-w-[280px]">Fetched: {fetchedMeta.title}</span>
+                <button
+                  type="button"
+                  onClick={() => setFetchedMeta(null)}
+                  className="text-emerald-600/70 hover:text-emerald-800 dark:hover:text-emerald-200 cursor-pointer"
+                  aria-label="Clear fetched URL label"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
           </div>
-        </div>
 
-        <div>
-          <label htmlFor="webpage-markup-textarea" className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-            Paste {markupMode === 'html' ? 'HTML' : 'Markdown'} markup (or drop a saved .html / .md file above)
-          </label>
-          <textarea
-            id="webpage-markup-textarea"
-            rows={10}
-            value={markupSource}
-            onChange={(e) => setMarkupSource(e.target.value)}
-            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500/40"
-          />
-        </div>
+          <div>
+            <label htmlFor={webTextareaId} className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+              Or paste / edit {markupMode === 'html' ? 'HTML' : 'Markdown'} markup (or upload a saved .html / .md file above)
+            </label>
+            <textarea
+              id={webTextareaId}
+              rows={9}
+              value={markupSource}
+              onChange={(e) => setMarkupSource(e.target.value)}
+              className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500/40"
+            />
+          </div>
 
-        <div className="flex justify-end">
-          <button
-            type="button"
-            disabled={processing || !markupSource.trim()}
-            onClick={() => void onRunTask(() => webpageHtmlToPdf(markupSource, markupMode, webPageSize))}
-            className="h-10 px-5 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center gap-2 cursor-pointer"
-          >
-            {processing && <Loader2 className="w-4 h-4 animate-spin" />}
-            <span>Convert to PDF</span>
-          </button>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              disabled={processing || fetchingUrl || !markupSource.trim()}
+              onClick={() =>
+                void onRunTask(() =>
+                  webpageHtmlToPdf(markupSource, markupMode, webPageSize, {
+                    title: fetchedMeta?.title,
+                    sourceUrl: fetchedMeta?.sourceUrl,
+                    fileName: activeUploadedFile
+                      ? sanitizeBaseName(activeUploadedFile.name)
+                      : fetchedMeta
+                        ? sanitizeBaseName(fetchedMeta.title.slice(0, 48))
+                        : undefined,
+                  }),
+                )
+              }
+              className="h-10 px-5 rounded-lg bg-slate-900 dark:bg-slate-100 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-50 text-white dark:text-slate-900 text-sm font-medium inline-flex items-center gap-2 cursor-pointer"
+            >
+              {processing && <Loader2 className="w-4 h-4 animate-spin" />}
+              <span>Convert Markup / File to PDF</span>
+            </button>
+          </div>
         </div>
       </div>
     );

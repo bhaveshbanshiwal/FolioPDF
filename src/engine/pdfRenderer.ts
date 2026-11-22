@@ -1,4 +1,9 @@
 import * as pdfjsLib from 'pdfjs-dist';
+import type { EditablePdfTextLine } from '../types/tools';
+import {
+  mergeRawTextRunsIntoEditableLines,
+  type RawPdfTextRun,
+} from '../utils/pdfUtils';
 
 // Use standard .js extension (emitted to dist/pdf.worker.min.js by Vite) so static hosts
 // such as GitHub Pages always serve it with application/javascript MIME type.
@@ -128,6 +133,95 @@ export async function renderPdfPageToCanvas(
   return { canvas, width: canvas.width, height: canvas.height };
 }
 
+function rgbToHex(r: number, g: number, b: number): string {
+  const clamp = (n: number) => Math.max(0, Math.min(255, Math.round(n)));
+  return `#${[clamp(r), clamp(g), clamp(b)].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * Samples pixels just outside the edges of a text bounding box on the rendered canvas
+ * and picks the median bright/background color so edited text patches blend seamlessly.
+ */
+function samplePerimeterBackgroundHex(
+  ctx: CanvasRenderingContext2D,
+  canvasW: number,
+  canvasH: number,
+  box: { x: number; y: number; width: number; height: number },
+): string {
+  try {
+    const px = Math.max(1, Math.floor(box.x * canvasW));
+    const py = Math.max(1, Math.floor(box.y * canvasH));
+    const pw = Math.max(2, Math.floor(box.width * canvasW));
+    const ph = Math.max(2, Math.floor(box.height * canvasH));
+
+    const samplePoints: Array<[number, number]> = [
+      [Math.max(0, px - 2), Math.max(0, py - 2)],
+      [Math.min(canvasW - 1, px + Math.floor(pw / 2)), Math.max(0, py - 2)],
+      [Math.min(canvasW - 1, px + pw + 2), Math.max(0, py - 2)],
+      [Math.max(0, px - 2), Math.min(canvasH - 1, py + ph + 2)],
+      [Math.min(canvasW - 1, px + Math.floor(pw / 2)), Math.min(canvasH - 1, py + ph + 2)],
+      [Math.min(canvasW - 1, px + pw + 2), Math.min(canvasH - 1, py + ph + 2)],
+    ];
+
+    const samples: Array<{ r: number; g: number; b: number; lum: number }> = [];
+    for (const [sx, sy] of samplePoints) {
+      const data = ctx.getImageData(sx, sy, 1, 1).data;
+      const r = data[0];
+      const g = data[1];
+      const b = data[2];
+      samples.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
+    }
+    if (samples.length === 0) return '#ffffff';
+    // Sort by luminance and pick upper-median sample (avoids dark ink bleed from nearby lines)
+    samples.sort((a, b) => a.lum - b.lum);
+    const pick = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.66))];
+    return rgbToHex(pick.r, pick.g, pick.b);
+  } catch {
+    return '#ffffff';
+  }
+}
+
+async function extractTextRunsForPage(
+  page: pdfjsLib.PDFPageProxy,
+): Promise<RawPdfTextRun[]> {
+  const vp1 = page.getViewport({ scale: 1 });
+  const content = await page.getTextContent();
+  const styles = (content.styles ?? {}) as Record<string, { fontFamily?: string }>;
+  const runs: RawPdfTextRun[] = [];
+
+  for (const item of content.items) {
+    if (!('str' in item) || !item.str || !item.str.trim()) continue;
+    const tx = pdfjsLib.Util.transform(vp1.transform, item.transform);
+    const fontHeightPt = Math.max(
+      6,
+      Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || item.height || 11,
+    );
+    const xPt = tx[4];
+    // tx[5] is baseline in top-down viewport coordinates; top of glyph box sits ~0.82 * fontHeight above baseline
+    const topPt = tx[5] - fontHeightPt * 0.84;
+    const widthPt = Math.max(
+      item.width ? Math.abs(item.width) : item.str.length * fontHeightPt * 0.52,
+      fontHeightPt * 0.4,
+    );
+    const heightPt = fontHeightPt * 1.12;
+
+    const styleFamily = styles[item.fontName]?.fontFamily ?? '';
+    const combinedFontName = `${item.fontName || ''} ${styleFamily}`.trim();
+
+    runs.push({
+      str: item.str,
+      x: Math.max(0, Math.min(0.99, xPt / vp1.width)),
+      y: Math.max(0, Math.min(0.99, topPt / vp1.height)),
+      width: Math.max(0.005, Math.min(1, widthPt / vp1.width)),
+      height: Math.max(0.008, Math.min(0.25, heightPt / vp1.height)),
+      fontSizePt: fontHeightPt,
+      fontName: combinedFontName,
+    });
+  }
+
+  return runs;
+}
+
 export async function renderSinglePageDataUrl(
   file: File,
   pageNumber: number,
@@ -144,6 +238,69 @@ export async function renderSinglePageDataUrl(
       height,
       pageCount: doc.numPages,
     };
+  } finally {
+    await closePdfJsDocument(doc);
+  }
+}
+
+export async function renderSinglePageWithTextLines(
+  file: File,
+  pageNumber: number,
+  scale = 1.35,
+  password?: string,
+): Promise<{
+  dataUrl: string;
+  width: number;
+  height: number;
+  pageCount: number;
+  textLines: EditablePdfTextLine[];
+}> {
+  const doc = await openPdfJsDocument(file, password);
+  try {
+    const safePage = Math.max(1, Math.min(pageNumber, doc.numPages));
+    const page = await doc.getPage(safePage);
+    const { canvas, width, height } = await renderPdfPageToCanvas(doc, safePage, scale);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const rawRuns = await extractTextRunsForPage(page);
+    const merged = mergeRawTextRunsIntoEditableLines(rawRuns, safePage - 1);
+    const textLines: EditablePdfTextLine[] = merged.map((line) => ({
+      ...line,
+      bgColor: ctx ? samplePerimeterBackgroundHex(ctx, width, height, line) : '#ffffff',
+    }));
+
+    return {
+      dataUrl: canvas.toDataURL('image/png'),
+      width,
+      height,
+      pageCount: doc.numPages,
+      textLines,
+    };
+  } finally {
+    await closePdfJsDocument(doc);
+  }
+}
+
+export async function extractAllPagesEditableTextLines(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<EditablePdfTextLine[]> {
+  const doc = await openPdfJsDocument(file);
+  const allLines: EditablePdfTextLine[] = [];
+  try {
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const rawRuns = await extractTextRunsForPage(page);
+      const merged = mergeRawTextRunsIntoEditableLines(rawRuns, i - 1);
+      for (const line of merged) {
+        allLines.push({ ...line, bgColor: '#ffffff' });
+      }
+      page.cleanup();
+      onProgress?.(Math.round((i / doc.numPages) * 100));
+      if (i % 10 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    return allLines;
   } finally {
     await closePdfJsDocument(doc);
   }

@@ -27,9 +27,9 @@ export function FormsAndSecurityTool({
 }: FormsAndSecurityToolProps) {
   const uid = useId();
   // Compress state
-  const [compressMode, setCompressMode] = useState<'structural' | 'raster'>('structural');
+  const [compressMode, setCompressMode] = useState<'structural' | 'hybrid-images' | 'raster'>('hybrid-images');
   const [compressDpi, setCompressDpi] = useState(110);
-  const [jpegQuality, setJpegQuality] = useState(0.65);
+  const [jpegQuality, setJpegQuality] = useState(0.68);
 
   // Protect state
   const [userPassword, setUserPassword] = useState('');
@@ -69,7 +69,13 @@ export function FormsAndSecurityTool({
 
   useEffect(() => {
     if (toolId === 'compress') {
-      onMultiplierChange?.(compressMode === 'raster' ? (compressDpi / 110) * 1.15 : 0.45);
+      if (compressMode === 'raster') {
+        onMultiplierChange?.((compressDpi / 110) * 1.2);
+      } else if (compressMode === 'hybrid-images') {
+        onMultiplierChange?.((compressDpi / 110) * 0.85);
+      } else {
+        onMultiplierChange?.(0.45);
+      }
     } else {
       onMultiplierChange?.(1);
     }
@@ -129,7 +135,7 @@ export function FormsAndSecurityTool({
     >
       {toolId === 'compress' && (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <button
               type="button"
               onClick={() => setCompressMode('structural')}
@@ -140,10 +146,27 @@ export function FormsAndSecurityTool({
               }`}
             >
               <p className="font-display font-semibold text-sm text-slate-900 dark:text-white">
-                Lossless Structural Cleanup
+                Lossless Cleanup
               </p>
               <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-                Preserves crisp vector text and searchability while compacting object streams and removing unused metadata.
+                Fastest. Compacts object streams and strips metadata while leaving every image and vector untouched.
+              </p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setCompressMode('hybrid-images')}
+              className={`p-4 rounded-xl border text-left transition-colors cursor-pointer ${
+                compressMode === 'hybrid-images'
+                  ? 'border-rose-500 bg-rose-50/50 dark:bg-rose-950/20'
+                  : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
+              }`}
+            >
+              <p className="font-display font-semibold text-sm text-slate-900 dark:text-white">
+                Smart Hybrid (Keeps Text)
+              </p>
+              <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                Re-encodes oversized embedded photos in place while preserving 100% crisp selectable vector text and links.
               </p>
             </button>
 
@@ -157,19 +180,21 @@ export function FormsAndSecurityTool({
               }`}
             >
               <p className="font-display font-semibold text-sm text-slate-900 dark:text-white">
-                Strong Image-DPI Compression
+                Strong Full-Page DPI
               </p>
               <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-                Best for heavy scans. Re-renders pages as compact JPEGs (pages become raster images).
+                Maximum shrinkage for scanned PDFs. Re-renders entire pages as JPEGs (higher RAM; text becomes image).
               </p>
             </button>
           </div>
 
-          {compressMode === 'raster' && (
+          {(compressMode === 'hybrid-images' || compressMode === 'raster') && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
               <div>
                 <label htmlFor={`${uid}-compress-dpi`} className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Target Resolution (DPI)
+                  {compressMode === 'hybrid-images'
+                    ? 'Embedded Image Cap (Target DPI)'
+                    : 'Target Page Resolution (DPI)'}
                 </label>
                 <select
                   id={`${uid}-compress-dpi`}
@@ -179,7 +204,10 @@ export function FormsAndSecurityTool({
                 >
                   <option value={72}>72 DPI (Smallest size — screen only)</option>
                   <option value={110}>110 DPI (Balanced — recommended)</option>
-                  <option value={150}>150 DPI (Clear readable text)</option>
+                  <option value={150}>150 DPI (High clarity)</option>
+                  {compressMode === 'raster' && (
+                    <option value={220}>220 DPI (Print grade — heavy RAM)</option>
+                  )}
                 </select>
               </div>
               <div>

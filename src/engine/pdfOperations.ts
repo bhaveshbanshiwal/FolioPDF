@@ -1,16 +1,32 @@
 import {
-  PDFDocument,
-  StandardFonts,
-  rgb,
-  degrees,
-  PDFName,
-  PDFRawStream,
+  PDFCheckBox,
   PDFDict,
+  PDFDocument,
+  PDFDropdown,
+  PDFName,
+  PDFNumber,
+  PDFOptionList,
+  PDFRadioGroup,
+  PDFRawStream,
+  PDFTextField,
+  StandardFonts,
+  degrees,
+  rgb,
+  type PDFFont,
 } from '@cantoo/pdf-lib';
 import JSZip from 'jszip';
-import type { CreatePdfBlock, PageOverlayItem, ToolResult } from '../types/tools';
+import type {
+  CreatePdfBlock,
+  PageOverlayItem,
+  PdfFontFamilyKey,
+  PdfFormFieldSummary,
+  ToolResult,
+} from '../types/tools';
 import {
+  extractHtmlTitle,
+  normalizeWebpageUrl,
   parseCsvRows,
+  parseJinaReaderResponse,
   parseMarkdownToBlocks,
   parsePageRanges,
   sanitizeBaseName,
@@ -369,16 +385,128 @@ export async function splitPdf(
   });
 }
 
-/** 3. Compress PDF */
+async function inflateDeflateBytes(bytes: Uint8Array): Promise<Uint8Array | null> {
+  if (typeof DecompressionStream === 'undefined') return null;
+  try {
+    const stream = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer])
+      .stream()
+      .pipeThrough(new DecompressionStream('deflate'));
+    const ab = await new Response(stream).arrayBuffer();
+    return new Uint8Array(ab);
+  } catch {
+    return null;
+  }
+}
+
+async function reencodeImageStreamToCompactJpeg(
+  rawBytes: Uint8Array,
+  filterName: string,
+  width: number,
+  height: number,
+  colorSpaceName: string,
+  bitsPerComponent: number,
+  maxDimension: number,
+  quality: number,
+): Promise<{ jpgBytes: Uint8Array; newWidth: number; newHeight: number } | null> {
+  let sourceCanvas: HTMLCanvasElement | null = null;
+  try {
+    const scale = Math.min(1, maxDimension / Math.max(width, height, 1));
+    const targetW = Math.max(1, Math.round(width * scale));
+    const targetH = Math.max(1, Math.round(height * scale));
+
+    if (filterName === '/DCTDecode') {
+      const blob = bytesToBlob(rawBytes, 'image/jpeg');
+      const bitmap = await createImageBitmap(blob);
+      try {
+        sourceCanvas = document.createElement('canvas');
+        sourceCanvas.width = targetW;
+        sourceCanvas.height = targetH;
+        const ctx = sourceCanvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, targetW, targetH);
+        ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+      } finally {
+        bitmap.close();
+      }
+    } else if (
+      filterName === '/FlateDecode' &&
+      bitsPerComponent === 8 &&
+      (colorSpaceName === '/DeviceRGB' || colorSpaceName === '/DeviceGray')
+    ) {
+      const inflated = await inflateDeflateBytes(rawBytes);
+      if (!inflated) return null;
+      const channels = colorSpaceName === '/DeviceGray' ? 1 : 3;
+      if (inflated.length < width * height * channels) return null;
+
+      const tmpCanvas = document.createElement('canvas');
+      tmpCanvas.width = width;
+      tmpCanvas.height = height;
+      const tmpCtx = tmpCanvas.getContext('2d');
+      if (!tmpCtx) return null;
+      const imgData = tmpCtx.createImageData(width, height);
+      const dst = imgData.data;
+      if (channels === 3) {
+        for (let i = 0, j = 0; i < dst.length; i += 4, j += 3) {
+          dst[i] = inflated[j];
+          dst[i + 1] = inflated[j + 1];
+          dst[i + 2] = inflated[j + 2];
+          dst[i + 3] = 255;
+        }
+      } else {
+        for (let i = 0, j = 0; i < dst.length; i += 4, j += 1) {
+          const g = inflated[j];
+          dst[i] = g;
+          dst[i + 1] = g;
+          dst[i + 2] = g;
+          dst[i + 3] = 255;
+        }
+      }
+      tmpCtx.putImageData(imgData, 0, 0);
+
+      if (targetW !== width || targetH !== height) {
+        sourceCanvas = document.createElement('canvas');
+        sourceCanvas.width = targetW;
+        sourceCanvas.height = targetH;
+        const ctx = sourceCanvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.drawImage(tmpCanvas, 0, 0, targetW, targetH);
+        tmpCanvas.width = 0;
+        tmpCanvas.height = 0;
+      } else {
+        sourceCanvas = tmpCanvas;
+      }
+    } else {
+      return null;
+    }
+
+    const jpgBlob = await new Promise<Blob | null>((resolve) => {
+      sourceCanvas!.toBlob((b) => resolve(b), 'image/jpeg', quality);
+    });
+    if (!jpgBlob) return null;
+    const jpgBytes = new Uint8Array(await jpgBlob.arrayBuffer());
+    return { jpgBytes, newWidth: targetW, newHeight: targetH };
+  } catch {
+    return null;
+  } finally {
+    if (sourceCanvas) {
+      sourceCanvas.width = 0;
+      sourceCanvas.height = 0;
+    }
+  }
+}
+
+/** 3. Compress PDF (Lossless, Smart Hybrid Image-Only keeping vector text, or Strong Raster DPI) */
 export async function compressPdf(
   file: File,
-  mode: 'structural' | 'raster',
+  mode: 'structural' | 'hybrid-images' | 'raster',
   dpi: number,
   jpegQuality: number,
-  onProgress?: (pct: number) => void,
+  onProgress?: (pct: number, stage?: string) => void,
 ): Promise<ToolResult> {
   const base = sanitizeBaseName(file.name);
   if (mode === 'structural') {
+    onProgress?.(25, 'Compacting PDF object streams…');
     const src = await PDFDocument.load(await file.arrayBuffer());
     const clean = await PDFDocument.create();
     const copied = await clean.copyPages(src, src.getPageIndices());
@@ -390,11 +518,108 @@ export async function compressPdf(
     clean.setProducer('FolioPDF');
     clean.setCreator('FolioPDF');
     const bytes = await clean.save({ useObjectStreams: true, addDefaultPage: false });
-    onProgress?.(100);
+    onProgress?.(100, 'Complete');
     return buildResultFromBytes(bytes, `${base}-compressed.pdf`, 'application/pdf', {
       originalBytes: file.size,
       pageCount: clean.getPageCount(),
       summary: 'Lossless structural optimization complete (object streams compacted, metadata cleaned).',
+    });
+  }
+
+  if (mode === 'hybrid-images') {
+    onProgress?.(10, 'Scanning embedded PDF images while preserving vector text…');
+    const doc = await PDFDocument.load(await file.arrayBuffer());
+    const clampedQuality = Math.max(0.25, Math.min(0.92, jpegQuality));
+    // Map chosen target DPI to a sensible max pixel dimension for embedded photos/charts
+    const maxDim = dpi <= 72 ? 850 : dpi <= 110 ? 1280 : 1700;
+
+    const candidates: Array<{
+      ref: Parameters<typeof doc.context.assign>[0];
+      stream: PDFRawStream;
+      filterName: string;
+      width: number;
+      height: number;
+      colorSpaceName: string;
+      bpc: number;
+    }> = [];
+
+    for (const [ref, obj] of doc.context.enumerateIndirectObjects()) {
+      if (!(obj instanceof PDFRawStream)) continue;
+      const dict = obj.dict;
+      if (dict.get(PDFName.of('Subtype'))?.toString() !== '/Image') continue;
+      // Skip image masks or soft masks so transparency/stencils remain intact
+      if (dict.get(PDFName.of('ImageMask'))?.toString() === 'true') continue;
+      if (dict.get(PDFName.of('SMask')) || dict.get(PDFName.of('Mask'))) continue;
+
+      const filterObj = dict.get(PDFName.of('Filter'));
+      const filterName = filterObj?.toString() ?? '';
+      if (filterName !== '/DCTDecode' && filterName !== '/FlateDecode') continue;
+
+      const widthObj = dict.get(PDFName.of('Width'));
+      const heightObj = dict.get(PDFName.of('Height'));
+      const bpcObj = dict.get(PDFName.of('BitsPerComponent'));
+      const csObj = dict.get(PDFName.of('ColorSpace'));
+
+      const width = widthObj instanceof PDFNumber ? widthObj.asNumber() : 0;
+      const height = heightObj instanceof PDFNumber ? heightObj.asNumber() : 0;
+      const bpc = bpcObj instanceof PDFNumber ? bpcObj.asNumber() : 8;
+      const colorSpaceName = csObj?.toString() ?? '/DeviceRGB';
+
+      // Skip tiny icons/bullets (< 10 KB) where re-encoding saves nothing
+      if (width < 64 || height < 64 || obj.contents.length < 10 * 1024) continue;
+
+      candidates.push({ ref, stream: obj, filterName, width, height, colorSpaceName, bpc });
+    }
+
+    let reencodedCount = 0;
+    let savedImageBytes = 0;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      const res = await reencodeImageStreamToCompactJpeg(
+        c.stream.contents,
+        c.filterName,
+        c.width,
+        c.height,
+        c.colorSpaceName,
+        c.bpc,
+        maxDim,
+        clampedQuality,
+      );
+      if (res && res.jpgBytes.length < c.stream.contents.length * 0.94) {
+        savedImageBytes += c.stream.contents.length - res.jpgBytes.length;
+        const newDict = c.stream.dict.clone(doc.context);
+        newDict.set(PDFName.of('Filter'), PDFName.of('DCTDecode'));
+        newDict.set(PDFName.of('ColorSpace'), PDFName.of('DeviceRGB'));
+        newDict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
+        newDict.set(PDFName.of('Width'), PDFNumber.of(res.newWidth));
+        newDict.set(PDFName.of('Height'), PDFNumber.of(res.newHeight));
+        newDict.set(PDFName.of('Length'), PDFNumber.of(res.jpgBytes.length));
+        newDict.delete(PDFName.of('DecodeParms'));
+        doc.context.assign(c.ref, PDFRawStream.of(newDict, res.jpgBytes));
+        reencodedCount++;
+      }
+      onProgress?.(
+        15 + Math.round(((i + 1) / Math.max(1, candidates.length)) * 75),
+        `Re-encoding embedded image ${i + 1} of ${candidates.length}…`,
+      );
+      if (i % 3 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    onProgress?.(94, 'Saving vector-preserving compressed PDF…');
+    const outBytes = await doc.save({ useObjectStreams: true });
+    onProgress?.(100, 'Complete');
+    const summary =
+      reencodedCount > 0
+        ? `Smart Hybrid compression re-encoded ${reencodedCount} embedded image(s) (saved ~${Math.round(savedImageBytes / 1024)} KB in images) while preserving 100% selectable vector text.`
+        : 'Smart Hybrid scan complete: no oversized embedded raster images found; compacted object streams while keeping 100% vector text.';
+
+    return buildResultFromBytes(outBytes, `${base}-smart-compressed.pdf`, 'application/pdf', {
+      originalBytes: file.size,
+      pageCount: doc.getPageCount(),
+      summary,
     });
   }
 
@@ -423,7 +648,7 @@ export async function compressPdf(
       const img = await outDoc.embedJpg(jpgBytes);
       const outPage = outDoc.addPage([vp1.width, vp1.height]);
       outPage.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
-      onProgress?.(Math.round((i / pdfJsDoc.numPages) * 92));
+      onProgress?.(Math.round((i / pdfJsDoc.numPages) * 92), `Compressing page ${i} of ${pdfJsDoc.numPages}…`);
       if (i % 4 === 0) {
         await new Promise((r) => setTimeout(r, 0));
       }
@@ -433,7 +658,7 @@ export async function compressPdf(
   }
 
   const outBytes = await outDoc.save({ useObjectStreams: true });
-  onProgress?.(100);
+  onProgress?.(100, 'Complete');
   return buildResultFromBytes(outBytes, `${base}-compressed-${dpi}dpi.pdf`, 'application/pdf', {
     originalBytes: file.size,
     pageCount: outDoc.getPageCount(),
@@ -441,15 +666,240 @@ export async function compressPdf(
   });
 }
 
-/** 4 & 5. Edit PDF & Sign PDF */
+/** Inspect native AcroForm fields in a PDF so Edit PDF can display fillable inputs */
+export async function inspectPdfFormFields(file: File): Promise<PdfFormFieldSummary[]> {
+  try {
+    const doc = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
+    const form = doc.getForm();
+    const fields = form.getFields();
+    const summaries: PdfFormFieldSummary[] = [];
+
+    for (const field of fields) {
+      const name = field.getName();
+      const readOnly = field.isReadOnly();
+      if (field instanceof PDFTextField) {
+        summaries.push({
+          name,
+          kind: 'text',
+          value: field.getText() ?? '',
+          readOnly,
+        });
+      } else if (field instanceof PDFCheckBox) {
+        summaries.push({
+          name,
+          kind: 'checkbox',
+          value: field.isChecked(),
+          readOnly,
+        });
+      } else if (field instanceof PDFDropdown) {
+        summaries.push({
+          name,
+          kind: 'dropdown',
+          value: field.getSelected()[0] ?? '',
+          options: field.getOptions(),
+          readOnly,
+        });
+      } else if (field instanceof PDFRadioGroup) {
+        summaries.push({
+          name,
+          kind: 'radio',
+          value: field.getSelected() ?? '',
+          options: field.getOptions(),
+          readOnly,
+        });
+      } else if (field instanceof PDFOptionList) {
+        summaries.push({
+          name,
+          kind: 'option-list',
+          value: field.getSelected()[0] ?? '',
+          options: field.getOptions(),
+          readOnly,
+        });
+      }
+    }
+    return summaries;
+  } catch {
+    return [];
+  }
+}
+
+async function resolveOverlayStandardFont(
+  doc: PDFDocument,
+  cache: Map<string, PDFFont>,
+  family: PdfFontFamilyKey = 'sans',
+  isBold = false,
+  isItalic = false,
+): Promise<PDFFont> {
+  const key = `${family}-${isBold ? 'b' : 'r'}-${isItalic ? 'i' : 'n'}`;
+  const existing = cache.get(key);
+  if (existing) return existing;
+
+  let std = StandardFonts.Helvetica;
+  if (family === 'serif') {
+    std =
+      isBold && isItalic
+        ? StandardFonts.TimesRomanBoldItalic
+        : isBold
+          ? StandardFonts.TimesRomanBold
+          : isItalic
+            ? StandardFonts.TimesRomanItalic
+            : StandardFonts.TimesRoman;
+  } else if (family === 'mono') {
+    std =
+      isBold && isItalic
+        ? StandardFonts.CourierBoldOblique
+        : isBold
+          ? StandardFonts.CourierBold
+          : isItalic
+            ? StandardFonts.CourierOblique
+            : StandardFonts.Courier;
+  } else {
+    std =
+      isBold && isItalic
+        ? StandardFonts.HelveticaBoldOblique
+        : isBold
+          ? StandardFonts.HelveticaBold
+          : isItalic
+            ? StandardFonts.HelveticaOblique
+            : StandardFonts.Helvetica;
+  }
+
+  const embedded = await doc.embedFont(std);
+  cache.set(key, embedded);
+  return embedded;
+}
+
+/** 4 & 5. Edit PDF (existing text editing, deep scrub rebuild, forms, annotations) & Sign PDF */
 export async function applyCanvasOverlaysToPdf(
   file: File,
   overlays: PageOverlayItem[],
   suffix: 'edited' | 'signed',
-  onProgress?: (pct: number) => void,
+  onProgress?: (pct: number, stage?: string) => void,
+  options?: {
+    scrubEditedPages?: boolean;
+    scrubDpi?: number;
+    formUpdates?: Record<string, string | boolean>;
+    flattenForms?: boolean;
+  },
 ): Promise<ToolResult> {
-  const doc = await PDFDocument.load(await file.arrayBuffer());
-  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const srcBytes = await file.arrayBuffer();
+  const baseDoc = await PDFDocument.load(srcBytes);
+
+  // Apply native AcroForm updates first (before any optional deep-scrub page rebuild)
+  let formUpdatedCount = 0;
+  if (options?.formUpdates && Object.keys(options.formUpdates).length > 0) {
+    try {
+      const form = baseDoc.getForm();
+      for (const [name, val] of Object.entries(options.formUpdates)) {
+        try {
+          const field = form.getField(name);
+          if (field instanceof PDFTextField && typeof val === 'string') {
+            field.setText(val);
+            formUpdatedCount++;
+          } else if (field instanceof PDFCheckBox && typeof val === 'boolean') {
+            if (val) field.check();
+            else field.uncheck();
+            formUpdatedCount++;
+          } else if (field instanceof PDFDropdown && typeof val === 'string') {
+            if (val) field.select(val);
+            formUpdatedCount++;
+          } else if (field instanceof PDFRadioGroup && typeof val === 'string') {
+            if (val) field.select(val);
+            formUpdatedCount++;
+          } else if (field instanceof PDFOptionList && typeof val === 'string') {
+            if (val) field.select(val);
+            formUpdatedCount++;
+          }
+        } catch {
+          // Ignore individual read-only or incompatible field errors
+        }
+      }
+      if (options.flattenForms) {
+        form.flatten();
+      }
+    } catch {
+      // Document has no AcroForm
+    }
+  } else if (options?.flattenForms) {
+    try {
+      baseDoc.getForm().flatten();
+    } catch {
+      // Ignore if no form
+    }
+  }
+
+  const scrubPageSet = new Set<number>();
+  if (options?.scrubEditedPages) {
+    for (const ov of overlays) {
+      if (ov.kind === 'replace-text') {
+        scrubPageSet.add(ov.pageIndex);
+      }
+    }
+  }
+
+  let doc = baseDoc;
+
+  // Deep Scrub Mode: rebuild ONLY pages that contain edited existing text so the old text layer is permanently removed
+  if (scrubPageSet.size > 0) {
+    onProgress?.(12, `Deep-scrubbing old text layer on ${scrubPageSet.size} edited page(s)…`);
+    const intermediateBytes = await baseDoc.save({ useObjectStreams: true });
+    const pdfJsDoc = await openPdfJsDocument(intermediateBytes);
+    const rebuilt = await PDFDocument.create();
+    const scrubScale = (options?.scrubDpi ?? 200) / 72;
+    const total = baseDoc.getPageCount();
+
+    try {
+      for (let idx = 0; idx < total; idx++) {
+        if (!scrubPageSet.has(idx)) {
+          const [copied] = await rebuilt.copyPages(baseDoc, [idx]);
+          rebuilt.addPage(copied);
+        } else {
+          const jsPage = await pdfJsDoc.getPage(idx + 1);
+          const vp1 = jsPage.getViewport({ scale: 1 });
+          const { canvas } = await renderPdfPageToCanvas(pdfJsDoc, idx + 1, scrubScale);
+          const ctx = canvas.getContext('2d')!;
+          // Paint matched background cover over every replaced-text box directly on the bitmap
+          const pageReplaces = overlays.filter(
+            (o) => o.pageIndex === idx && o.kind === 'replace-text',
+          );
+          for (const rep of pageReplaces) {
+            ctx.fillStyle = rep.bgColor ?? '#ffffff';
+            const padLeft = Math.max(2, canvas.width * 0.004);
+            const padRight = Math.max(6, rep.width * canvas.width * 0.04 + canvas.width * 0.01);
+            const padY = Math.max(2, rep.height * canvas.height * 0.22);
+            ctx.fillRect(
+              Math.max(0, rep.x * canvas.width - padLeft),
+              Math.max(0, rep.y * canvas.height - padY * 0.45),
+              rep.width * canvas.width + padLeft + padRight,
+              rep.height * canvas.height + padY * 1.5,
+            );
+          }
+          const jpgBlob = await new Promise<Blob>((resolve, reject) => {
+            canvas.toBlob(
+              (b) => (b ? resolve(b) : reject(new Error(`Failed to rebuild page ${idx + 1}.`))),
+              'image/jpeg',
+              0.92,
+            );
+          });
+          canvas.width = 0;
+          canvas.height = 0;
+          jsPage.cleanup();
+          const img = await rebuilt.embedJpg(new Uint8Array(await jpgBlob.arrayBuffer()));
+          const newPage = rebuilt.addPage([vp1.width, vp1.height]);
+          newPage.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+        }
+        onProgress?.(
+          15 + Math.round(((idx + 1) / total) * 50),
+          `Compiling page ${idx + 1} of ${total}…`,
+        );
+      }
+    } finally {
+      await closePdfJsDocument(pdfJsDoc);
+    }
+    doc = rebuilt;
+  }
+
+  const fontCache = new Map<string, PDFFont>();
   const pages = doc.getPages();
 
   for (let idx = 0; idx < overlays.length; idx++) {
@@ -465,7 +915,54 @@ export async function applyCanvasOverlaysToPdf(
     const yBottomPt = ph - (item.y + item.height) * ph;
     const [r, g, b] = hexToRgbTuple(item.color ?? '#0f172a');
 
-    if (item.kind === 'text' && item.text) {
+    if (item.kind === 'replace-text') {
+      // Unless already scrubbed onto bitmap, cover the original text with its sampled background color
+      if (!scrubPageSet.has(item.pageIndex)) {
+        const [br, bg, bb] = hexToRgbTuple(item.bgColor ?? '#ffffff');
+        const padLeft = 2;
+        const padRight = Math.max(6, wPt * 0.04 + 4);
+        const padBottom = Math.max(2.0, hPt * 0.24);
+        const padTop = Math.max(1.2, hPt * 0.12);
+        page.drawRectangle({
+          x: Math.max(0, xPt - padLeft),
+          y: Math.max(0, yBottomPt - padBottom),
+          width: Math.max(8, wPt + padLeft + padRight),
+          height: Math.max(6, hPt + padBottom + padTop),
+          color: rgb(br, bg, bb),
+        });
+      }
+      const newText = item.text ?? '';
+      if (newText.trim().length > 0) {
+        const font = await resolveOverlayStandardFont(
+          doc,
+          fontCache,
+          item.fontFamily ?? 'sans',
+          Boolean(item.isBold),
+          Boolean(item.isItalic),
+        );
+        const fontSize = Math.max(6, item.fontSize ?? 11);
+        const baselineY = ph - item.y * ph - fontSize * 0.86;
+        const lines = newText.split('\n');
+        let cursorY = baselineY;
+        for (const line of lines) {
+          page.drawText(line.replace(/[^\x20-\x7E\xA0-\xFF]/g, ' '), {
+            x: xPt,
+            y: cursorY,
+            size: fontSize,
+            font,
+            color: rgb(r, g, b),
+          });
+          cursorY -= fontSize * 1.24;
+        }
+      }
+    } else if (item.kind === 'text' && item.text) {
+      const font = await resolveOverlayStandardFont(
+        doc,
+        fontCache,
+        item.fontFamily ?? 'sans',
+        Boolean(item.isBold),
+        Boolean(item.isItalic),
+      );
       const fontSize = item.fontSize ?? 14;
       const lines = item.text.split('\n');
       let cursorY = ph - item.y * ph - fontSize;
@@ -531,16 +1028,38 @@ export async function applyCanvasOverlaysToPdf(
       });
     }
 
-    onProgress?.(Math.round(((idx + 1) / Math.max(1, overlays.length)) * 90));
+    onProgress?.(
+      (scrubPageSet.size > 0 ? 68 : 10) +
+        Math.round(((idx + 1) / Math.max(1, overlays.length)) * (scrubPageSet.size > 0 ? 24 : 82)),
+      'Applying edits to PDF…',
+    );
   }
 
+  onProgress?.(95, 'Compiling final PDF…');
   const outBytes = await doc.save({ useObjectStreams: true });
-  onProgress?.(100);
+  onProgress?.(100, 'Complete');
   const base = sanitizeBaseName(file.name);
+  const replacedCount = overlays.filter((o) => o.kind === 'replace-text').length;
+  const parts: string[] = [];
+  if (replacedCount > 0) {
+    parts.push(
+      `${replacedCount} existing text edit(s)${scrubPageSet.size > 0 ? ` (deep-scrubbed ${scrubPageSet.size} page(s))` : ''}`,
+    );
+  }
+  const otherCount = overlays.length - replacedCount;
+  if (otherCount > 0) {
+    parts.push(`${otherCount} ${suffix === 'signed' ? 'signature' : 'annotation'} element(s)`);
+  }
+  if (formUpdatedCount > 0) {
+    parts.push(`${formUpdatedCount} form field(s)${options?.flattenForms ? ' flattened' : ' updated'}`);
+  } else if (options?.flattenForms) {
+    parts.push('form fields flattened');
+  }
+
   return buildResultFromBytes(outBytes, `${base}-${suffix}.pdf`, 'application/pdf', {
     originalBytes: file.size,
     pageCount: doc.getPageCount(),
-    summary: `Applied ${overlays.length} ${suffix === 'signed' ? 'signature' : 'edit'} element(s) to PDF.`,
+    summary: parts.length > 0 ? `Applied ${parts.join(', ')} to PDF.` : 'Saved updated PDF.',
   });
 }
 
@@ -1369,6 +1888,8 @@ export async function createPdfFromStructuredBlocks(
     marginPt: number;
     fileName: string;
     title?: string;
+    sourceUrl?: string;
+    summary?: string;
   },
 ): Promise<ToolResult> {
   const doc = await PDFDocument.create();
@@ -1380,12 +1901,37 @@ export async function createPdfFromStructuredBlocks(
   const pageH = options.pageSize === 'a4' ? 841.89 : 792;
   const m = options.marginPt;
   const contentW = pageW - m * 2;
+  const bottomLimit = options.sourceUrl ? m + 16 : m;
 
   let page = doc.addPage([pageW, pageH]);
   let y = pageH - m;
 
+  if (options.sourceUrl) {
+    const safeUrl = options.sourceUrl.replace(/[^\x20-\x7E]/g, '').slice(0, 110);
+    const metaLabel = `Source: ${safeUrl}`;
+    const metaLines = wrapTextToLines(metaLabel, fontReg, 8.5, contentW);
+    for (const ml of metaLines) {
+      page.drawText(ml, {
+        x: m,
+        y: y - 8.5,
+        size: 8.5,
+        font: fontReg,
+        color: rgb(0.42, 0.48, 0.57),
+      });
+      y -= 12;
+    }
+    y -= 2;
+    page.drawLine({
+      start: { x: m, y },
+      end: { x: pageW - m, y },
+      thickness: 0.5,
+      color: rgb(0.84, 0.87, 0.91),
+    });
+    y -= 14;
+  }
+
   const ensureSpace = (needed: number) => {
-    if (y - needed < m) {
+    if (y - needed < bottomLimit) {
       page = doc.addPage([pageW, pageH]);
       y = pageH - m;
     }
@@ -1432,10 +1978,26 @@ export async function createPdfFromStructuredBlocks(
     y -= isHeading ? 10 : isSub ? 6 : 8;
   }
 
+  if (options.sourceUrl) {
+    const pages = doc.getPages();
+    const total = pages.length;
+    pages.forEach((p, idx) => {
+      const footerText = `Page ${idx + 1} of ${total}`;
+      const textW = fontReg.widthOfTextAtSize(footerText, 8.5);
+      p.drawText(footerText, {
+        x: pageW - m - textW,
+        y: Math.max(20, m * 0.45),
+        size: 8.5,
+        font: fontReg,
+        color: rgb(0.47, 0.53, 0.62),
+      });
+    });
+  }
+
   const bytes = await doc.save({ useObjectStreams: true });
   return buildResultFromBytes(bytes, options.fileName, 'application/pdf', {
     pageCount: doc.getPageCount(),
-    summary: `Generated a ${doc.getPageCount()}-page vector PDF locally.`,
+    summary: options.summary ?? `Generated a ${doc.getPageCount()}-page vector PDF locally.`,
   });
 }
 
@@ -1565,25 +2127,256 @@ export async function createPdfFromComposerBlocks(
   });
 }
 
-/** 16. Webpage / HTML / Markdown to PDF */
+export interface FetchedWebpageSource {
+  sourceUrl: string;
+  hostname: string;
+  title: string;
+  mode: 'html' | 'markdown';
+  content: string;
+  fetchedVia: 'direct' | 'reader' | 'cors-fallback';
+}
+
+const MAX_WEBPAGE_TEXT_BYTES = 4 * 1024 * 1024;
+
+async function fetchTextWithTimeout(
+  url: string,
+  timeoutMs: number,
+  headers?: Record<string, string>,
+): Promise<{ text: string; contentType: string }> {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      mode: 'cors',
+      credentials: 'omit',
+      headers,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (
+      contentType &&
+      !contentType.includes('text/') &&
+      !contentType.includes('html') &&
+      !contentType.includes('xml') &&
+      !contentType.includes('json') &&
+      !contentType.includes('markdown')
+    ) {
+      throw new Error(`Unsupported binary content type (${contentType.split(';')[0]}).`);
+    }
+    const text = await res.text();
+    if (text.length > MAX_WEBPAGE_TEXT_BYTES) {
+      return { text: text.slice(0, MAX_WEBPAGE_TEXT_BYTES), contentType };
+    }
+    return { text, contentType };
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+}
+
+/**
+ * Fetches a live public webpage directly in the browser (100% static / GitHub Pages compatible).
+ * Tries direct CORS fetch first, then falls back to public CORS-enabled readers for public domains.
+ */
+export async function fetchWebpageFromUrl(
+  rawUrl: string,
+  onProgress?: (pct: number, stage?: string) => void,
+): Promise<FetchedWebpageSource> {
+  const normalized = normalizeWebpageUrl(rawUrl);
+  if (normalized.error || !normalized.url || !normalized.hostname) {
+    throw new Error(normalized.error ?? 'Enter a valid webpage URL.');
+  }
+
+  const targetUrl = normalized.url;
+  const hostname = normalized.hostname;
+
+  const isSameOrigin =
+    typeof globalThis.location !== 'undefined' &&
+    new URL(targetUrl).origin === globalThis.location.origin;
+  const isCorsFriendlyRawHost =
+    hostname === 'raw.githubusercontent.com' ||
+    hostname === 'gist.githubusercontent.com' ||
+    hostname === 'cdn.jsdelivr.net' ||
+    /\.(?:md|txt)(?:[?#].*)?$/i.test(targetUrl);
+
+  const tryDirectFetch = async (): Promise<FetchedWebpageSource | null> => {
+    try {
+      const direct = await fetchTextWithTimeout(targetUrl, 7000, {
+        Accept: 'text/html,text/markdown,text/plain;q=0.9,*/*;q=0.5',
+      });
+      const isMarkdown =
+        direct.contentType.includes('markdown') ||
+        direct.contentType.includes('text/plain') ||
+        /\.md(?:[?#].*)?$/i.test(targetUrl);
+      if (direct.text.trim().length > 0) {
+        const title = (!isMarkdown ? extractHtmlTitle(direct.text) : null) || hostname;
+        onProgress?.(65, 'Extracted webpage content directly…');
+        return {
+          sourceUrl: targetUrl,
+          hostname,
+          title,
+          mode: isMarkdown ? 'markdown' : 'html',
+          content: direct.text,
+          fetchedVia: 'direct',
+        };
+      }
+      return null;
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('Unsupported binary content type')) {
+        throw new Error(
+          `${err.message} This tool converts HTML/text webpages — download the file directly or use our PDF/Image tools instead.`,
+        );
+      }
+      return null;
+    }
+  };
+
+  onProgress?.(15, `Connecting to ${hostname}…`);
+
+  // For same-origin, private/local URLs, or raw Markdown/text hosts, try direct browser fetch first
+  if (isSameOrigin || normalized.isPrivateHost || isCorsFriendlyRawHost) {
+    const directResult = await tryDirectFetch();
+    if (directResult) return directResult;
+
+    if (normalized.isPrivateHost) {
+      throw new Error(
+        `Direct fetch to "${hostname}" was blocked by browser CORS, and private/local addresses are never sent to external readers. Save the page as .html (Ctrl+S) and drop the file above instead.`,
+      );
+    }
+  }
+
+  // Primary strategy for public external websites: CORS-friendly reader (r.jina.ai) — works cleanly on static GitHub Pages without CORS console errors
+  onProgress?.(35, `Fetching ${hostname} via public webpage reader…`);
+  try {
+    const readerUrl = `https://r.jina.ai/${targetUrl}`;
+    const readerRes = await fetchTextWithTimeout(readerUrl, 20000, {
+      Accept: 'text/plain',
+    });
+    const parsed = parseJinaReaderResponse(readerRes.text, targetUrl);
+    if (parsed.markdown.trim().length > 0) {
+      onProgress?.(70, 'Parsed webpage article content…');
+      return {
+        sourceUrl: targetUrl,
+        hostname,
+        title: parsed.title || hostname,
+        mode: 'markdown',
+        content: parsed.markdown,
+        fetchedVia: 'reader',
+      };
+    }
+  } catch {
+    // Fall through to backup readers
+  }
+
+  // Fallback 1: Secondary raw HTML CORS relay
+  onProgress?.(55, `Trying backup webpage reader for ${hostname}…`);
+  try {
+    const backupUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+    const backupRes = await fetchTextWithTimeout(backupUrl, 10000);
+    if (backupRes.text.trim().length > 0) {
+      const title = extractHtmlTitle(backupRes.text) || hostname;
+      onProgress?.(75, 'Extracted HTML content…');
+      return {
+        sourceUrl: targetUrl,
+        hostname,
+        title,
+        mode: 'html',
+        content: backupRes.text,
+        fetchedVia: 'cors-fallback',
+      };
+    }
+  } catch {
+    // Fall through to direct fetch fallback
+  }
+
+  // Fallback 2: Direct browser fetch (in case the site allows CORS and public readers were unreachable)
+  if (!isSameOrigin && !normalized.isPrivateHost && !isCorsFriendlyRawHost) {
+    const directFallback = await tryDirectFetch();
+    if (directFallback) return directFallback;
+  }
+
+  throw new Error(
+    `Could not fetch "${hostname}" automatically (the site may require login, sit behind a paywall, or block automated readers). Save the webpage in your browser (Ctrl+S → Webpage, HTML Only) and drop the saved .html file above.`,
+  );
+}
+
+/** 16a. Webpage / HTML / Markdown to PDF */
 export async function webpageHtmlToPdf(
   sourceText: string,
   mode: 'html' | 'markdown',
   pageSize: 'a4' | 'letter',
+  options?: {
+    title?: string;
+    sourceUrl?: string;
+    fileName?: string;
+    summary?: string;
+  },
 ): Promise<ToolResult> {
   if (!sourceText.trim()) {
-    throw new Error('Paste HTML/Markdown or upload an .html file first.');
+    throw new Error('Enter a webpage link, paste HTML/Markdown, or upload an .html/.md file first.');
   }
   const blocks = mode === 'html' ? stripHtmlToBlocks(sourceText) : parseMarkdownToBlocks(sourceText);
   if (blocks.length === 0) {
     throw new Error('No printable text content was found in the provided markup.');
   }
+  const inferredTitle =
+    options?.title ||
+    (mode === 'html' ? extractHtmlTitle(sourceText) : null) ||
+    blocks.find((b) => b.type === 'heading')?.text ||
+    'Converted Document';
+  const defaultName = options?.fileName
+    ? `${sanitizeBaseName(options.fileName)}.pdf`
+    : mode === 'html'
+      ? 'webpage-converted.pdf'
+      : 'markdown-converted.pdf';
+
   return createPdfFromStructuredBlocks(blocks, {
     pageSize,
     marginPt: 48,
-    fileName: mode === 'html' ? 'webpage-converted.pdf' : 'markdown-converted.pdf',
-    title: 'Converted Document',
+    fileName: defaultName,
+    title: inferredTitle,
+    sourceUrl: options?.sourceUrl,
+    summary: options?.summary,
   });
+}
+
+/** 16b. Live Webpage URL Link to PDF */
+export async function webpageUrlToPdf(
+  rawUrl: string,
+  pageSize: 'a4' | 'letter',
+  onProgress?: (pct: number, stage?: string) => void,
+): Promise<ToolResult> {
+  const fetched = await fetchWebpageFromUrl(rawUrl, onProgress);
+  onProgress?.(85, 'Building vector PDF…');
+
+  const cleanHost = fetched.hostname.replace(/^www\./, '').replace(/[^a-zA-Z0-9-]+/g, '-');
+  const cleanTitle =
+    fetched.title && fetched.title !== fetched.hostname
+      ? fetched.title
+          .slice(0, 42)
+          .replace(/[^a-zA-Z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+      : '';
+  const baseName = cleanTitle ? `${cleanHost}-${cleanTitle}` : cleanHost || 'webpage';
+
+  const methodLabel =
+    fetched.fetchedVia === 'direct'
+      ? 'direct browser fetch'
+      : fetched.fetchedVia === 'reader'
+        ? 'public webpage reader'
+        : 'backup HTML reader';
+
+  const result = await webpageHtmlToPdf(fetched.content, fetched.mode, pageSize, {
+    title: fetched.title,
+    sourceUrl: fetched.sourceUrl,
+    fileName: baseName,
+    summary: `Converted "${fetched.title}" (${fetched.sourceUrl}) via ${methodLabel}.`,
+  });
+  onProgress?.(100, 'Complete');
+  return result;
 }
 
 /** 6. Multi-format PDF Converter */
