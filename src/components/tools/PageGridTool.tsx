@@ -96,14 +96,16 @@ export function PageGridTool({ toolId, file, processing, onRunTask }: PageGridTo
   useEffect(() => {
     if (toolId !== 'crop') return;
     let active = true;
+    setCropPreview(null);
     renderSinglePageDataUrl(file, cropPage, 1.2)
       .then((res) => {
         if (!active) return;
         setCropPreview({ dataUrl: res.dataUrl, width: res.width, height: res.height });
         setTotalPages(res.pageCount);
       })
-      .catch(() => {
-        // Error surfaced by thumbnail loader
+      .catch((err) => {
+        if (!active) return;
+        setThumbError(err instanceof Error ? err.message : 'Could not render crop preview.');
       });
     return () => {
       active = false;
@@ -401,6 +403,13 @@ export function PageGridTool({ toolId, file, processing, onRunTask }: PageGridTo
                       left: `${cropMargins.left * 100}%`,
                     }}
                   />
+                </div>
+              ) : thumbError ? (
+                <div
+                  role="alert"
+                  className="w-full rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30 p-4 text-xs text-red-700 dark:text-red-300"
+                >
+                  Could not render preview ({thumbError}). You can still adjust margins and apply crop.
                 </div>
               ) : (
                 <div className="h-72 w-56 rounded-lg bg-slate-100 dark:bg-slate-800 animate-pulse" />

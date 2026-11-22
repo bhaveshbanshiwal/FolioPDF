@@ -33,6 +33,8 @@ export function CanvasOverlayTool({
     null,
   );
   const [loadingPage, setLoadingPage] = useState(true);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [renderNonce, setRenderNonce] = useState(0);
 
   // Overlays stored in normalized 0..1 coordinates across all pages
   const [overlays, setOverlays] = useState<PageOverlayItem[]>([]);
@@ -70,6 +72,7 @@ export function CanvasOverlayTool({
   useEffect(() => {
     let active = true;
     setLoadingPage(true);
+    setPageError(null);
     renderSinglePageDataUrl(file, pageNumber, 1.35)
       .then((res) => {
         if (!active) return;
@@ -77,13 +80,18 @@ export function CanvasOverlayTool({
         setTotalPages(res.pageCount);
         setLoadingPage(false);
       })
-      .catch(() => {
-        if (active) setLoadingPage(false);
+      .catch((err) => {
+        if (!active) return;
+        setPageImg(null);
+        setPageError(
+          err instanceof Error ? err.message : 'Unable to render this PDF page preview.',
+        );
+        setLoadingPage(false);
       });
     return () => {
       active = false;
     };
-  }, [file, pageNumber]);
+  }, [file, pageNumber, renderNonce]);
 
   // Generate typed signature PNG whenever typedSig changes in Sign mode
   useEffect(() => {
@@ -614,8 +622,29 @@ export function CanvasOverlayTool({
           </div>
         </div>
 
-        {loadingPage || !pageImg ? (
-          <div className="w-full max-w-lg aspect-[3/4] rounded-lg bg-slate-100 dark:bg-slate-800 animate-pulse" />
+        {loadingPage ? (
+          <div className="w-full max-w-lg aspect-[3/4] rounded-lg bg-slate-100 dark:bg-slate-800 animate-pulse flex items-center justify-center text-xs text-slate-500 dark:text-slate-400">
+            Rendering page {pageNumber}…
+          </div>
+        ) : pageError || !pageImg ? (
+          <div
+            role="alert"
+            className="w-full max-w-lg rounded-xl border border-red-200 dark:border-red-900 bg-red-50/90 dark:bg-red-950/30 p-5 text-center space-y-3"
+          >
+            <p className="text-sm font-display font-semibold text-red-800 dark:text-red-200">
+              Could not load PDF page preview
+            </p>
+            <p className="text-xs text-red-700 dark:text-red-300 break-words leading-relaxed">
+              {pageError ?? 'The file may be encrypted, corrupted, or the PDF worker failed to load.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => setRenderNonce((n) => n + 1)}
+              className="h-8 px-3.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-medium cursor-pointer"
+            >
+              Retry Preview
+            </button>
+          </div>
         ) : (
           <div
             ref={stageRef}

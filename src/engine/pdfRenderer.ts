@@ -1,7 +1,13 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+// Use standard .js extension (emitted to dist/pdf.worker.min.js by Vite) so static hosts
+// such as GitHub Pages always serve it with application/javascript MIME type.
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  typeof document !== 'undefined'
+    ? new URL('pdf.worker.min.js', document.baseURI).href
+    : './pdf.worker.min.js';
+
+const docBlobUrls = new WeakMap<pdfjsLib.PDFDocumentProxy, string>();
 
 export interface PdfDocumentMeta {
   pageCount: number;
@@ -24,13 +30,30 @@ export async function openPdfJsDocument(
   file: File | Uint8Array,
   password?: string,
 ): Promise<pdfjsLib.PDFDocumentProxy> {
-  const data = file instanceof Uint8Array ? file.slice() : new Uint8Array(await file.arrayBuffer());
-  const task = pdfjsLib.getDocument({
-    data,
-    password,
-    useSystemFonts: true,
-  });
-  return task.promise;
+  if (file instanceof Uint8Array) {
+    const task = pdfjsLib.getDocument({
+      data: file.slice(),
+      password,
+      useSystemFonts: true,
+    });
+    return task.promise;
+  }
+
+  // Stream local File via Blob URL so large 200+ MB PDFs are not duplicated in main-thread RAM.
+  const blobUrl = URL.createObjectURL(file);
+  try {
+    const task = pdfjsLib.getDocument({
+      url: blobUrl,
+      password,
+      useSystemFonts: true,
+    });
+    const doc = await task.promise;
+    docBlobUrls.set(doc, blobUrl);
+    return doc;
+  } catch (err) {
+    URL.revokeObjectURL(blobUrl);
+    throw err;
+  }
 }
 
 export async function closePdfJsDocument(doc: pdfjsLib.PDFDocumentProxy): Promise<void> {
@@ -46,6 +69,11 @@ export async function closePdfJsDocument(doc: pdfjsLib.PDFDocumentProxy): Promis
     } catch {
       // Ignore destroy errors
     }
+  }
+  const blobUrl = docBlobUrls.get(doc);
+  if (blobUrl) {
+    URL.revokeObjectURL(blobUrl);
+    docBlobUrls.delete(doc);
   }
 }
 

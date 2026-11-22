@@ -402,17 +402,31 @@ export async function compressPdf(
   const pdfJsDoc = await openPdfJsDocument(file);
   const outDoc = await PDFDocument.create();
   const scale = dpi / 72;
+  const clampedQuality = Math.max(0.15, Math.min(0.95, jpegQuality));
   try {
     for (let i = 1; i <= pdfJsDoc.numPages; i++) {
       const page = await pdfJsDoc.getPage(i);
       const vp1 = page.getViewport({ scale: 1 });
       const { canvas } = await renderPdfPageToCanvas(pdfJsDoc, i, scale);
-      const jpgDataUrl = canvas.toDataURL('image/jpeg', Math.max(0.15, Math.min(0.95, jpegQuality)));
-      const jpgBytes = dataUrlToUint8Array(jpgDataUrl);
+      const jpgBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => (b ? resolve(b) : reject(new Error(`Failed to encode page ${i} as JPEG.`))),
+          'image/jpeg',
+          clampedQuality,
+        );
+      });
+      // Immediately release bitmap backing store for large multi-page PDFs
+      canvas.width = 0;
+      canvas.height = 0;
+      page.cleanup();
+      const jpgBytes = new Uint8Array(await jpgBlob.arrayBuffer());
       const img = await outDoc.embedJpg(jpgBytes);
       const outPage = outDoc.addPage([vp1.width, vp1.height]);
       outPage.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
       onProgress?.(Math.round((i / pdfJsDoc.numPages) * 92));
+      if (i % 4 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
   } finally {
     await closePdfJsDocument(pdfJsDoc);
