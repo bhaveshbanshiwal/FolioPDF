@@ -221,6 +221,7 @@ export function ToolWorkspace({
     ) => {
       setProcessing(true);
       setError(null);
+      replaceResult(null);
       setProgress(5);
       setStageText('Processing locally…');
       onTabStateUpdate(tabId, { status: 'processing', progress: 5 });
