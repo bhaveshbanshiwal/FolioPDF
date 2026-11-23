@@ -10,6 +10,7 @@ import {
   pdfToImages,
   webpageHtmlToPdf,
   webpageUrlToPdf,
+  type PdfConverterTarget,
 } from '../../engine/pdfOperations';
 import type { CreatePdfBlock, ToolResult } from '../../types/tools';
 import { formatBytes, sanitizeBaseName } from '../../utils/pdfUtils';
@@ -73,7 +74,10 @@ export function ConverterAndImagesTool({
 }: ConverterAndImagesToolProps) {
   // PDF Converter state
   const firstIsPdf = files[0]?.name.toLowerCase().endsWith('.pdf') || files[0]?.type === 'application/pdf';
-  const [convertTarget, setConvertTarget] = useState<'pdf' | 'txt' | 'md' | 'html' | 'docx' | 'png-zip'>('txt');
+  const [convertTarget, setConvertTarget] = useState<PdfConverterTarget>('docx');
+  const [pptxExportMode, setPptxExportMode] = useState<'editable' | 'visual'>('editable');
+  const [sheetOrientation, setSheetOrientation] = useState<'auto' | 'portrait' | 'landscape'>('auto');
+  const sheetOrientationId = useId();
 
   useEffect(() => {
     if (toolId === 'converter' && files.length > 0) {
@@ -102,10 +106,16 @@ export function ConverterAndImagesTool({
   useEffect(() => {
     if (toolId === 'pdf-to-images') {
       onMultiplierChange?.(exportDpi / 150);
+    } else if (toolId === 'converter' && firstIsPdf) {
+      if (convertTarget === 'png-zip' || (convertTarget === 'pptx' && pptxExportMode === 'visual')) {
+        onMultiplierChange?.(1.65);
+      } else {
+        onMultiplierChange?.(1);
+      }
     } else {
       onMultiplierChange?.(1);
     }
-  }, [toolId, exportDpi, onMultiplierChange]);
+  }, [toolId, exportDpi, firstIsPdf, convertTarget, pptxExportMode, onMultiplierChange]);
 
   // Webpage / HTML to PDF state
   const webUrlInputId = useId();
@@ -143,12 +153,28 @@ export function ConverterAndImagesTool({
 
   if (toolId === 'converter') {
     const file = files[0];
+    const ext = file.name.toLowerCase().split('.').pop() ?? '';
+    const isSpreadsheetInput = ['xlsx', 'ods', 'csv', 'tsv'].includes(ext);
+    const isPptxInput = ext === 'pptx';
+
+    const effectiveTarget: PdfConverterTarget = firstIsPdf
+      ? convertTarget === 'pptx' && pptxExportMode === 'visual'
+        ? 'pptx-visual'
+        : convertTarget
+      : 'pdf';
+
     return (
       <div className="rounded-xl bg-white dark:bg-[#131C31] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-display font-semibold text-slate-900 dark:text-white">
-              {firstIsPdf ? 'Convert PDF to another format' : 'Convert file to PDF'}
+              {firstIsPdf
+                ? 'Convert PDF to another format'
+                : isPptxInput
+                  ? 'Convert PowerPoint (.pptx) to PDF'
+                  : isSpreadsheetInput
+                    ? `Convert Spreadsheet (.${ext}) to PDF`
+                    : 'Convert file to PDF'}
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
               Input: <span className="font-mono">{file.name}</span> ({formatBytes(file.size)})
@@ -157,34 +183,119 @@ export function ConverterAndImagesTool({
         </div>
 
         {firstIsPdf ? (
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-            {(
-              [
-                ['docx', 'Word (.docx)'],
-                ['txt', 'Plain Text (.txt)'],
-                ['md', 'Markdown (.md)'],
-                ['html', 'Web HTML (.html)'],
-                ['png-zip', 'PNG Images (.zip)'],
-              ] as const
-            ).map(([fmt, label]) => (
-              <button
-                key={fmt}
-                type="button"
-                onClick={() => setConvertTarget(fmt)}
-                className={`h-10 px-3 rounded-lg border text-xs font-medium transition-colors cursor-pointer ${
-                  convertTarget === fmt
-                    ? 'bg-rose-600 text-white border-rose-600'
-                    : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {(
+                [
+                  ['docx', 'Word (.docx)'],
+                  ['pptx', 'PowerPoint (.pptx)'],
+                  ['xlsx', 'Excel / Sheets (.xlsx)'],
+                  ['csv', 'Spreadsheet (.csv)'],
+                  ['txt', 'Plain Text (.txt)'],
+                  ['md', 'Markdown (.md)'],
+                  ['html', 'Web HTML (.html)'],
+                  ['png-zip', 'PNG Images (.zip)'],
+                ] as const
+              ).map(([fmt, label]) => (
+                <button
+                  key={fmt}
+                  type="button"
+                  onClick={() => setConvertTarget(fmt)}
+                  className={`h-10 px-3 rounded-lg border text-xs font-medium transition-colors cursor-pointer ${
+                    convertTarget === fmt
+                      ? 'bg-rose-600 text-white border-rose-600'
+                      : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-slate-300 dark:hover:border-slate-600'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {convertTarget === 'pptx' && (
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-3 space-y-2">
+                <p className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                  PowerPoint Slide Mode
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPptxExportMode('editable')}
+                    className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer ${
+                      pptxExportMode === 'editable'
+                        ? 'border-rose-500 bg-rose-50/70 dark:bg-rose-950/30'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900'
+                    }`}
+                  >
+                    <p className="text-xs font-semibold text-slate-900 dark:text-white">
+                      Editable Text Slides
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Creates real editable text boxes at exact PDF positions for PowerPoint & Google Slides.
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPptxExportMode('visual')}
+                    className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer ${
+                      pptxExportMode === 'visual'
+                        ? 'border-rose-500 bg-rose-50/70 dark:bg-rose-950/30'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900'
+                    }`}
+                  >
+                    <p className="text-xs font-semibold text-slate-900 dark:text-white">
+                      Exact Visual Slides (150 DPI)
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Preserves charts, diagrams, and custom graphics identically on each slide.
+                    </p>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {(convertTarget === 'xlsx' || convertTarget === 'csv') && (
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                Uses coordinate-aware row & column detection to reconstruct tables into{' '}
+                {convertTarget === 'xlsx'
+                  ? 'an Excel / Google Sheets workbook (.xlsx) with one sheet per page plus a combined summary.'
+                  : 'a clean RFC-4180 CSV spreadsheet.'}
+              </p>
+            )}
           </div>
         ) : (
-          <p className="text-xs text-slate-600 dark:text-slate-400">
-            Will convert <span className="font-mono">{files.length}</span> file(s) cleanly into a standard PDF document.
-          </p>
+          <div className="space-y-3">
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              {isPptxInput
+                ? 'Preserves slide aspect ratio (16:9 / 4:3), backgrounds, positioned text, slide tables, and embedded PNG/JPEG images in a vector PDF.'
+                : isSpreadsheetInput
+                  ? 'Parses every worksheet into styled multi-page PDF tables with proportional column widths and repeating headers.'
+                  : `Will convert ${files.length} file(s) cleanly into a standard PDF document.`}
+            </p>
+
+            {isSpreadsheetInput && (
+              <div className="flex flex-wrap items-center gap-2.5">
+                <label
+                  htmlFor={sheetOrientationId}
+                  className="text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  Sheet Page Orientation:
+                </label>
+                <select
+                  id={sheetOrientationId}
+                  value={sheetOrientation}
+                  onChange={(e) =>
+                    setSheetOrientation(e.target.value as 'auto' | 'portrait' | 'landscape')
+                  }
+                  className="h-8 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs text-slate-800 dark:text-slate-200"
+                >
+                  <option value="auto">Auto (Landscape for &gt; 5 columns)</option>
+                  <option value="landscape">Landscape (Wide sheets)</option>
+                  <option value="portrait">Portrait (Compact tables)</option>
+                </select>
+              </div>
+            )}
+          </div>
         )}
 
         <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex justify-end">
@@ -193,7 +304,9 @@ export function ConverterAndImagesTool({
             disabled={processing}
             onClick={() =>
               void onRunTask((setProgress) =>
-                convertWithPdfConverter(files, firstIsPdf ? convertTarget : 'pdf', setProgress),
+                convertWithPdfConverter(files, effectiveTarget, setProgress, {
+                  sheetOrientation,
+                }),
               )
             }
             className="h-10 px-5 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center gap-2 cursor-pointer"

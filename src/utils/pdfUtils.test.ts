@@ -16,11 +16,24 @@ import {
   mergeRawTextRunsIntoEditableLines,
   findMatchingTextLineSlices,
 } from './pdfUtils';
+import JSZip from 'jszip';
 import {
   buildDeviceProfile,
   inspectFileHeaderBytes,
   assessWorkloadRisk,
 } from './preflight';
+import {
+  buildEditablePptxBlob,
+  buildXlsxBlob,
+  columnIndexToExcelRef,
+  excelColRefToIndex,
+  groupPdfLinesIntoSheetRows,
+  parseOdsContentXml,
+  parsePptxSlideXml,
+  parseXlsxSharedStringsXml,
+  parseXlsxWorksheetXml,
+  rowsToCsv,
+} from './officeUtils';
 
 test('parsePageRanges handles single pages, ranges, reverse ranges, and bounds errors', () => {
   assert.deepEqual(parsePageRanges('1-3, 5, 8-9', 10), { pages: [1, 2, 3, 5, 8, 9] });
@@ -268,4 +281,129 @@ test('classifyPdfFontStyle, mergeRawTextRunsIntoEditableLines, and findMatchingT
   assert.equal(matches[0].matchText, 'Acme');
   assert.ok(matches[0].x > merged[2].x);
   assert.ok(matches[0].width < merged[2].width);
+});
+
+test('XLSX and ODS utilities parse sheets and round-trip buildXlsxBlob cleanly', async () => {
+  assert.equal(columnIndexToExcelRef(0), 'A');
+  assert.equal(columnIndexToExcelRef(25), 'Z');
+  assert.equal(columnIndexToExcelRef(26), 'AA');
+  assert.equal(excelColRefToIndex('A1'), 0);
+  assert.equal(excelColRefToIndex('AA14'), 26);
+
+  const shared = parseXlsxSharedStringsXml(
+    '<sst><si><t>Department</t></si><si><t>Budget &amp; Ops</t></si></sst>',
+  );
+  assert.deepEqual(shared, ['Department', 'Budget & Ops']);
+
+  const parsedGrid = parseXlsxWorksheetXml(
+    `<worksheet><sheetData>
+      <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+      <row r="2"><c r="A2" t="inlineStr"><is><t>Engineering</t></is></c><c r="B2"><v>42500</v></c></row>
+    </sheetData></worksheet>`,
+    shared,
+  );
+  assert.deepEqual(parsedGrid, [
+    ['Department', 'Budget & Ops'],
+    ['Engineering', '42500'],
+  ]);
+
+  const odsSheets = parseOdsContentXml(
+    `<office:spreadsheet>
+      <table:table table:name="Q4 Forecast">
+        <table:table-row>
+          <table:table-cell><text:p>Region</text:p></table:table-cell>
+          <table:table-cell><text:p>Units</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell><text:p>APAC</text:p></table:table-cell>
+          <table:table-cell><text:p>910</text:p></table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>`,
+  );
+  assert.equal(odsSheets.length, 1);
+  assert.equal(odsSheets[0].name, 'Q4 Forecast');
+  assert.deepEqual(odsSheets[0].rows, [
+    ['Region', 'Units'],
+    ['APAC', '910'],
+  ]);
+
+  // Round-trip buildXlsxBlob -> JSZip -> parseXlsxWorksheetXml
+  const xlsxBlob = await buildXlsxBlob([
+    {
+      name: 'Revenue:Q4/2026',
+      rows: [
+        ['Region', 'Revenue', 'Margin'],
+        ['North', '128000', '24.5'],
+        ['South', '94500', '21.0'],
+      ],
+    },
+  ]);
+  const zip = await JSZip.loadAsync(await xlsxBlob.arrayBuffer());
+  assert.ok(zip.file('[Content_Types].xml'));
+  assert.ok(zip.file('xl/workbook.xml'));
+  assert.ok(zip.file('xl/styles.xml'));
+  const sheetXml = await zip.file('xl/worksheets/sheet1.xml')!.async('string');
+  const roundTripped = parseXlsxWorksheetXml(sheetXml, []);
+  assert.deepEqual(roundTripped, [
+    ['Region', 'Revenue', 'Margin'],
+    ['North', '128000', '24.5'],
+    ['South', '94500', '21.0'],
+  ]);
+});
+
+test('PPTX utilities build valid OOXML deck and parse slide shapes, tables, and PDF table rows', async () => {
+  const pptxBlob = await buildEditablePptxBlob([
+    {
+      widthPt: 960,
+      heightPt: 540,
+      lines: [
+        { text: 'Executive Summary 2026', x: 0.08, y: 0.1, width: 0.6, height: 0.08, fontSizePt: 26, isBold: true },
+        { text: 'All tasks execute locally in-browser.', x: 0.08, y: 0.25, width: 0.7, height: 0.05, fontSizePt: 15 },
+      ],
+    },
+  ]);
+  const zip = await JSZip.loadAsync(await pptxBlob.arrayBuffer());
+  assert.ok(zip.file('[Content_Types].xml'));
+  assert.ok(zip.file('ppt/presentation.xml'));
+  assert.ok(zip.file('ppt/slideMasters/slideMaster1.xml'));
+  assert.ok(zip.file('ppt/slideLayouts/slideLayout1.xml'));
+  assert.ok(zip.file('ppt/theme/theme1.xml'));
+  const slideXml = await zip.file('ppt/slides/slide1.xml')!.async('string');
+  const parsedSlide = parsePptxSlideXml(slideXml, 1);
+  assert.equal(parsedSlide.shapes.length, 2);
+  assert.equal(parsedSlide.shapes[0].paragraphs[0].text, 'Executive Summary 2026');
+  assert.equal(parsedSlide.shapes[1].paragraphs[0].text, 'All tasks execute locally in-browser.');
+
+  // Coordinate-aware PDF lines -> spreadsheet rows & RFC-4180 CSV
+  const rows = groupPdfLinesIntoSheetRows([
+    { id: '1', pageIndex: 0, text: 'Item', x: 0.1, y: 0.1, width: 0.15, height: 0.02, fontSizePt: 11, fontFamily: 'sans', isBold: true, isItalic: false },
+    { id: '2', pageIndex: 0, text: 'Cost', x: 0.6, y: 0.1, width: 0.1, height: 0.02, fontSizePt: 11, fontFamily: 'sans', isBold: true, isItalic: false },
+    { id: '3', pageIndex: 0, text: 'Widget, Pro', x: 0.1, y: 0.16, width: 0.2, height: 0.02, fontSizePt: 10, fontFamily: 'sans', isBold: false, isItalic: false },
+    { id: '4', pageIndex: 0, text: '299', x: 0.6, y: 0.16, width: 0.08, height: 0.02, fontSizePt: 10, fontFamily: 'sans', isBold: false, isItalic: false },
+  ]);
+  assert.deepEqual(rows, [
+    ['Item', 'Cost'],
+    ['Widget, Pro', '299'],
+  ]);
+  assert.equal(rowsToCsv(rows), 'Item,Cost\r\n"Widget, Pro",299');
+
+  // Preflight accepts .pptx & .xlsx cleanly without caution, while flagging legacy .xls
+  const desktop = buildDeviceProfile({ deviceMemoryGb: 16, hardwareConcurrency: 12, isMobile: false, jsHeapLimitBytes: null });
+  const pptxRisk = assessWorkloadRisk({
+    probes: [{ fileName: 'deck.pptx', sizeBytes: 250_000, detectedType: 'zip-or-docx', isEncryptedPdf: false, hasValidPdfHeader: false }],
+    toolId: 'converter',
+    otherTabsBytes: 0,
+    device: desktop,
+  });
+  assert.equal(pptxRisk.level, 'ok');
+  assert.equal(pptxRisk.issues.length, 0);
+
+  const legacyXlsRisk = assessWorkloadRisk({
+    probes: [{ fileName: 'old.xls', sizeBytes: 120_000, detectedType: 'unknown', isEncryptedPdf: false, hasValidPdfHeader: false }],
+    toolId: 'converter',
+    otherTabsBytes: 0,
+    device: desktop,
+  });
+  assert.equal(legacyXlsRisk.level, 'caution');
 });

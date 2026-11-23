@@ -320,14 +320,14 @@ export function assessWorkloadRisk(input: {
       }
     } else if (tool.expectedKind === 'converter') {
       const ext = probe.fileName.toLowerCase().split('.').pop() ?? '';
-      if (['doc', 'ppt', 'pptx', 'xls', 'xlsx'].includes(ext)) {
+      if (['doc', 'ppt', 'xls'].includes(ext)) {
         issues.push({
           id: `office-limit-${probe.fileName}`,
           severity: 'caution',
           fileName: probe.fileName,
-          title: 'Legacy or complex Office format',
-          detail: `".${ext}" files cannot be faithfully converted in pure client-side JavaScript without a server engine.`,
-          actionHint: 'Export to PDF, CSV, HTML, Markdown, or .docx first for best results.',
+          title: 'Legacy binary Office 97–2003 format',
+          detail: `Legacy binary ".${ext}" files cannot be parsed directly in the browser.`,
+          actionHint: `Save or export as .${ext}x (or .csv / .ods / PDF) first — modern .docx, .pptx, and .xlsx files convert locally.`,
         });
       }
     }

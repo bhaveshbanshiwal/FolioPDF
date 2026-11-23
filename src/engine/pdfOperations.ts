@@ -35,6 +35,13 @@ import {
   type StructuredTextBlock,
 } from '../utils/pdfUtils';
 import {
+  pdfToCsv,
+  pdfToPptx,
+  pdfToXlsx,
+  pptxToPdf,
+  spreadsheetToPdf,
+} from './officeConverter';
+import {
   closePdfJsDocument,
   extractPdfTextByPage,
   openPdfJsDocument,
@@ -2380,29 +2387,43 @@ export async function webpageUrlToPdf(
 }
 
 /** 6. Multi-format PDF Converter */
+export type PdfConverterTarget =
+  | 'pdf'
+  | 'txt'
+  | 'md'
+  | 'html'
+  | 'docx'
+  | 'pptx'
+  | 'pptx-visual'
+  | 'xlsx'
+  | 'csv'
+  | 'png-zip';
+
 export async function convertWithPdfConverter(
   files: File[],
-  targetFormat: 'pdf' | 'txt' | 'md' | 'html' | 'docx' | 'png-zip',
+  targetFormat: PdfConverterTarget,
   onProgress?: (pct: number) => void,
+  options?: { sheetOrientation?: 'auto' | 'portrait' | 'landscape' },
 ): Promise<ToolResult> {
   if (files.length === 0) throw new Error('Select at least one file to convert.');
   const first = files[0];
   const base = sanitizeBaseName(first.name);
 
   if (targetFormat === 'pdf') {
-    // Convert Images, TXT, MD, HTML, CSV, or basic DOCX to PDF
+    // Convert Images, PPTX, Sheets (XLSX/ODS/CSV/TSV), DOCX, TXT, MD, or HTML to PDF
     const ext = first.name.toLowerCase().split('.').pop() ?? '';
     if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
       return imagesToPdf(files, 'a4', 'portrait', 36, onProgress);
     }
-    if (ext === 'csv') {
-      const text = await first.text();
-      return createPdfFromComposerBlocks(
-        [
-          { id: 'h', type: 'heading', content: first.name },
-          { id: 't', type: 'table', content: text },
-        ],
-        { pageSize: 'a4', marginPt: 40, title: base },
+    if (ext === 'pptx') {
+      return pptxToPdf(first, onProgress);
+    }
+    if (['xlsx', 'ods', 'csv', 'tsv'].includes(ext)) {
+      return spreadsheetToPdf(first, options?.sheetOrientation ?? 'auto', onProgress);
+    }
+    if (ext === 'ppt' || ext === 'xls' || ext === 'doc') {
+      throw new Error(
+        `Legacy binary .${ext} (Office 97–2003) files cannot be parsed directly in the browser. Save/export as .${ext}x (or .csv) and drop it here.`,
       );
     }
     if (ext === 'docx') {
@@ -2429,6 +2450,18 @@ export async function convertWithPdfConverter(
   // Converting FROM PDF
   if (targetFormat === 'png-zip') {
     return pdfToImages(first, 'png', 150, '', onProgress);
+  }
+  if (targetFormat === 'pptx') {
+    return pdfToPptx(first, 'editable', onProgress);
+  }
+  if (targetFormat === 'pptx-visual') {
+    return pdfToPptx(first, 'visual', onProgress);
+  }
+  if (targetFormat === 'xlsx') {
+    return pdfToXlsx(first, onProgress);
+  }
+  if (targetFormat === 'csv') {
+    return pdfToCsv(first, onProgress);
   }
 
   const pages = await extractPdfTextByPage(first, onProgress);

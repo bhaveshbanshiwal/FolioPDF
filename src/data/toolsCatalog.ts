@@ -83,14 +83,15 @@ export const TOOLS_CATALOG: ToolDefinition[] = [
     name: 'PDF Converter',
     shortName: 'Converter',
     category: 'convert',
-    description: 'Convert between PDF and TXT, Markdown, HTML, CSV, basic DOCX, or images.',
+    description: 'Convert between PDF and Word (.docx), PowerPoint (.pptx), Sheets (.xlsx/.ods/.csv), HTML, Markdown, or images.',
     capability: 'workaround',
     capabilityNote:
-      'Client-side note: Supports Images, Text, Markdown, HTML, CSV, and basic Word (.docx) locally. Complex Office layouts, slides, and formulas require a server-side engine like LibreOffice.',
-    accept: '.pdf,.txt,.md,.html,.htm,.csv,.docx,.png,.jpg,.jpeg,.webp',
+      'Client-side converter: Supports bidirectional PDF ↔ Word (.docx), PowerPoint (.pptx — editable text or exact visual slides), Excel/Sheets (.xlsx, .ods, .csv, .tsv), Markdown, HTML, TXT, and images 100% locally. Complex slide animations, SmartArt, and live Excel macros/formulas require desktop Office or LibreOffice.',
+    accept: '.pdf,.docx,.pptx,.xlsx,.ods,.csv,.tsv,.txt,.md,.html,.htm,.png,.jpg,.jpeg,.webp',
     multiple: true,
     expectedKind: 'converter',
     memoryMultiplier: 4.5,
+    computeWeight: 2.0,
   },
 
   // Row 2 of reference grid
