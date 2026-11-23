@@ -3,11 +3,11 @@ import JSZip from 'jszip';
 import type { ToolResult } from '../types/tools';
 import {
   extractBlocksFromLegacyDoc,
+  extractRichSlidesFromLegacyPpt,
   extractSheetsFromLegacyXls,
-  extractSlidesFromLegacyPpt,
   parseEnhancedDocxXml,
-  parseOdpContentXml,
   parseOdtContentXml,
+  parseRichOdpXml,
   parseRtfToBlocks,
 } from '../utils/legacyOfficeUtils';
 import {
@@ -16,15 +16,22 @@ import {
   buildXlsxBlob,
   decodeXmlEntities,
   groupPdfLinesIntoSheetRows,
-  type ParsedPptxSlide,
   type ParsedSheet,
   parseOdsContentXml,
-  parsePptxSlideXml,
   parseTsvRows,
   parseXlsxSharedStringsXml,
   parseXlsxWorksheetXml,
   rowsToCsv,
 } from '../utils/officeUtils';
+import { parsePptxArchive } from '../utils/pptxParser';
+import type {
+  RichParsedSlide,
+  SlideGradient,
+  SlideImageCrop,
+  SlideImageSource,
+  SlideShapeElement,
+  SlideTableElement,
+} from '../utils/presentationTypes';
 import {
   parseCsvRows,
   sanitizeBaseName,
@@ -43,10 +50,9 @@ function sanitizeWinAnsi(text: string): string {
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2022/g, '*')
     .replace(/\u2026/g, '...')
     .replace(/\u00A0/g, ' ')
-    .replace(/[^\x09\x0A\x0D\x20-\xFF]/g, '?');
+    .replace(/[^\x09\x0A\x0D\x20-\xFF\u2022]/g, '?');
 }
 
 function hexToRgb(hex: string) {
@@ -154,51 +160,916 @@ function resolveZipTargetPath(baseDir: string, target: string): string {
   return resolved.join('/');
 }
 
-async function embedZipMediaImage(
-  pdfDoc: PDFDocument,
-  bytes: Uint8Array,
-  mediaPath: string,
-): Promise<PDFImage | null> {
-  const ext = mediaPath.toLowerCase().split('.').pop() ?? '';
-  try {
-    if (ext === 'png') {
-      return await pdfDoc.embedPng(bytes);
-    }
-    if (ext === 'jpg' || ext === 'jpeg') {
-      return await pdfDoc.embedJpg(bytes);
-    }
-    // Convert WebP / GIF / BMP via browser canvas if available
-    if (typeof document !== 'undefined' && ['webp', 'gif', 'bmp'].includes(ext)) {
-      const mime = ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/bmp';
-      const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: mime });
-      const bitmap = await createImageBitmap(blob);
-      const canvas = document.createElement('canvas');
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(bitmap, 0, 0);
-        bitmap.close();
-        const jpgBlob = await new Promise<Blob | null>((res) =>
-          canvas.toBlob((b) => res(b), 'image/jpeg', 0.9),
-        );
-        if (jpgBlob) {
-          return await pdfDoc.embedJpg(new Uint8Array(await jpgBlob.arrayBuffer()));
-        }
-      }
-      bitmap.close();
-    }
-  } catch {
-    return null;
+function detectImageMime(bytes: Uint8Array, pathOrMime?: string): string {
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png';
   }
-  return null;
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) {
+    return 'image/bmp';
+  }
+  if (bytes.length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return 'image/gif';
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  const low = (pathOrMime ?? '').toLowerCase();
+  if (low.includes('svg')) return 'image/svg+xml';
+  if (low.endsWith('.png') || low === 'image/png') return 'image/png';
+  if (low.endsWith('.jpg') || low.endsWith('.jpeg') || low === 'image/jpeg') return 'image/jpeg';
+  if (low.endsWith('.webp') || low === 'image/webp') return 'image/webp';
+  if (low.endsWith('.gif') || low === 'image/gif') return 'image/gif';
+  if (low.endsWith('.bmp') || low === 'image/bmp') return 'image/bmp';
+  return 'application/octet-stream';
+}
+
+function getHexLuminance(hex: string): number {
+  const clean = hex.replace('#', '').padEnd(6, '0').slice(0, 6);
+  const n = Number.parseInt(clean, 16);
+  if (!Number.isFinite(n)) return 1;
+  const r = ((n >> 16) & 255) / 255;
+  const g = ((n >> 8) & 255) / 255;
+  const b = (n & 255) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
 /**
- * Converts a PowerPoint (.pptx) presentation into a multi-page vector PDF preserving
- * slide aspect ratio (16:9 / 4:3), background colors, positioned text, tables, and embedded images.
+ * Rasterizes an image via browser canvas when cropping, rounded/circular masking,
+ * or non-native PDF formats (BMP, WebP, GIF, SVG) are needed.
+ */
+async function rasterizeImageForPdf(
+  bytes: Uint8Array,
+  mime: string,
+  options?: {
+    crop?: SlideImageCrop;
+    mask?: 'rect' | 'roundRect' | 'ellipse';
+    cornerRadiusFrac?: number;
+    targetAspect?: number;
+  },
+): Promise<{ bytes: Uint8Array; format: 'png' | 'jpg' } | null> {
+  if (typeof document === 'undefined') return null;
+
+  const blob = new Blob(
+    [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
+    { type: mime },
+  );
+
+  let source: ImageBitmap | HTMLImageElement | null = null;
+  let natW = 0;
+  let natH = 0;
+  let objectUrl: string | null = null;
+
+  try {
+    if (mime !== 'image/svg+xml' && typeof createImageBitmap === 'function') {
+      const bm = await createImageBitmap(blob);
+      source = bm;
+      natW = bm.width;
+      natH = bm.height;
+    } else {
+      objectUrl = URL.createObjectURL(blob);
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error('Image load failed'));
+        el.src = objectUrl!;
+      });
+      source = img;
+      natW = img.naturalWidth || img.width || 600;
+      natH = img.naturalHeight || img.height || 400;
+    }
+
+    if (natW <= 0 || natH <= 0 || !source) return null;
+
+    const crop = options?.crop;
+    const sx = crop ? Math.round(crop.l * natW) : 0;
+    const sy = crop ? Math.round(crop.t * natH) : 0;
+    const sw = Math.max(1, Math.round(natW * (1 - (crop?.l ?? 0) - (crop?.r ?? 0))));
+    const sh = Math.max(1, Math.round(natH * (1 - (crop?.t ?? 0) - (crop?.b ?? 0))));
+
+    // Clamp giant source images to 1800px max edge for crisp quality + fast PDF size
+    const maxEdge = 1800;
+    const scale = Math.min(1, maxEdge / Math.max(sw, sh));
+    const cw = Math.max(1, Math.round(sw * scale));
+    const ch = Math.max(1, Math.round(sh * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    const needsAlpha =
+      mime === 'image/png' ||
+      mime === 'image/svg+xml' ||
+      mime === 'image/webp' ||
+      mime === 'image/gif' ||
+      options?.mask === 'ellipse' ||
+      options?.mask === 'roundRect';
+
+    ctx.save();
+    if (options?.mask === 'ellipse') {
+      ctx.beginPath();
+      ctx.ellipse(cw / 2, ch / 2, cw / 2, ch / 2, 0, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.clip();
+    } else if (options?.mask === 'roundRect') {
+      const r = Math.min(cw, ch) * (options.cornerRadiusFrac ?? 0.14);
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.lineTo(cw - r, 0);
+      ctx.quadraticCurveTo(cw, 0, cw, r);
+      ctx.lineTo(cw, ch - r);
+      ctx.quadraticCurveTo(cw, ch, cw - r, ch);
+      ctx.lineTo(r, ch);
+      ctx.quadraticCurveTo(0, ch, 0, ch - r);
+      ctx.lineTo(0, r);
+      ctx.quadraticCurveTo(0, 0, r, 0);
+      ctx.closePath();
+      ctx.clip();
+    } else if (!needsAlpha) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, cw, ch);
+    }
+
+    ctx.drawImage(source, sx, sy, sw, sh, 0, 0, cw, ch);
+    ctx.restore();
+
+    const outMime = needsAlpha ? 'image/png' : 'image/jpeg';
+    const outBlob = await new Promise<Blob | null>((res) =>
+      canvas.toBlob((b) => res(b), outMime, 0.9),
+    );
+    canvas.width = 0;
+    canvas.height = 0;
+    if (!outBlob) return null;
+
+    return {
+      bytes: new Uint8Array(await outBlob.arrayBuffer()),
+      format: needsAlpha ? 'png' : 'jpg',
+    };
+  } catch {
+    return null;
+  } finally {
+    if (source && 'close' in source && typeof source.close === 'function') {
+      source.close();
+    }
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function renderGradientToImage(
+  pdfDoc: PDFDocument,
+  grad: SlideGradient,
+  widthPt: number,
+  heightPt: number,
+  geometry: 'rect' | 'roundRect' | 'ellipse',
+  cornerRadiusFrac?: number,
+): Promise<PDFImage | null> {
+  if (typeof document === 'undefined') return null;
+  const cw = Math.max(64, Math.min(640, Math.round(widthPt * 1.2)));
+  const ch = Math.max(64, Math.min(480, Math.round(heightPt * 1.2)));
+  const canvas = document.createElement('canvas');
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const rad = ((grad.angleDeg ?? 90) * Math.PI) / 180;
+  const cx = cw / 2;
+  const cy = ch / 2;
+  const dx = Math.cos(rad) * cx;
+  const dy = Math.sin(rad) * cy;
+  const g = ctx.createLinearGradient(cx - dx, cy - dy, cx + dx, cy + dy);
+  g.addColorStop(0, grad.fromHex);
+  g.addColorStop(1, grad.toHex);
+
+  ctx.save();
+  if (geometry === 'ellipse') {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, cx, cy, 0, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+  } else if (geometry === 'roundRect') {
+    const r = Math.min(cw, ch) * (cornerRadiusFrac ?? 0.14);
+    ctx.beginPath();
+    ctx.moveTo(r, 0);
+    ctx.lineTo(cw - r, 0);
+    ctx.quadraticCurveTo(cw, 0, cw, r);
+    ctx.lineTo(cw, ch - r);
+    ctx.quadraticCurveTo(cw, ch, cw - r, ch);
+    ctx.lineTo(r, ch);
+    ctx.quadraticCurveTo(0, ch, 0, ch - r);
+    ctx.lineTo(0, r);
+    ctx.quadraticCurveTo(0, 0, r, 0);
+    ctx.closePath();
+    ctx.clip();
+  }
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.restore();
+
+  const outMime = geometry === 'rect' ? 'image/jpeg' : 'image/png';
+  const blob = await new Promise<Blob | null>((res) => canvas.toBlob((b) => res(b), outMime, 0.92));
+  canvas.width = 0;
+  canvas.height = 0;
+  if (!blob) return null;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  try {
+    return outMime === 'image/png' ? await pdfDoc.embedPng(bytes) : await pdfDoc.embedJpg(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Builds an SVG path for a rounded rectangle in pdf-lib drawSvgPath (y-down relative to top-left x,y). */
+function buildRoundedRectSvgPath(w: number, h: number, rRaw: number): string {
+  const r = Math.max(0.5, Math.min(rRaw, w / 2, h / 2));
+  return [
+    `M ${r} 0`,
+    `L ${w - r} 0`,
+    `Q ${w} 0 ${w} ${r}`,
+    `L ${w} ${h - r}`,
+    `Q ${w} ${h} ${w - r} ${h}`,
+    `L ${r} ${h}`,
+    `Q 0 ${h} 0 ${h - r}`,
+    `L 0 ${r}`,
+    `Q 0 0 ${r} 0`,
+    'Z',
+  ].join(' ');
+}
+
+/**
+ * Unified high-fidelity slide -> PDF engine used by .pptx/.pptm/.ppsx/.potx, legacy .ppt, and .odp.
+ * Preserves slide dimensions, backgrounds (solid, gradient, image), master/layout frames,
+ * z-ordered shapes (fills, gradients, rounded rectangles, ellipses, lines, borders),
+ * embedded images (PNG/JPEG/BMP/WebP/GIF/SVG with crops & frame masks), positioned styled tables,
+ * and rich aligned typography with smart frame auto-fit.
+ */
+async function renderRichSlidesToPdf(
+  slides: RichParsedSlide[],
+  meta: {
+    file: File;
+    label: string;
+    zip?: JSZip;
+  },
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  if (slides.length === 0) {
+    throw new Error(`No slide content could be extracted from "${meta.file.name}".`);
+  }
+
+  const pdfDoc = await PDFDocument.create();
+  const baseName = sanitizeBaseName(meta.file.name);
+  pdfDoc.setTitle(baseName);
+  pdfDoc.setCreator('FolioPDF');
+
+  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const italicFont = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
+  const boldItalicFont = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique);
+
+  const pickFont = (isBold?: boolean, isItalic?: boolean): PDFFont => {
+    if (isBold && isItalic) return boldItalicFont;
+    if (isBold) return boldFont;
+    if (isItalic) return italicFont;
+    return regularFont;
+  };
+
+  // Cache embedded images across slides (huge win for repeated master logos/backgrounds)
+  const imageCache = new Map<string, PDFImage | null>();
+  const bytesKeyMap = new WeakMap<Uint8Array, number>();
+  let nextBytesId = 1;
+  let embeddedImagesCount = 0;
+
+  const resolveAndEmbedImage = async (
+    source: SlideImageSource,
+    options?: {
+      crop?: SlideImageCrop;
+      mask?: 'rect' | 'roundRect' | 'ellipse';
+      cornerRadiusFrac?: number;
+    },
+  ): Promise<PDFImage | null> => {
+    let baseKey: string;
+    let rawBytes: Uint8Array | null = null;
+    let hint = '';
+
+    if (source.kind === 'zip') {
+      if (!meta.zip) return null;
+      const cleanPath = source.path.replace(/^\/+/, '');
+      baseKey = `zip:${cleanPath}`;
+      hint = cleanPath;
+    } else {
+      let id = bytesKeyMap.get(source.bytes);
+      if (!id) {
+        id = nextBytesId++;
+        bytesKeyMap.set(source.bytes, id);
+      }
+      baseKey = `bytes:${id}`;
+      hint = source.mime;
+    }
+
+    const cropKey = options?.crop
+      ? `${options.crop.l.toFixed(3)},${options.crop.t.toFixed(3)},${options.crop.r.toFixed(3)},${options.crop.b.toFixed(3)}`
+      : '';
+    const cacheKey = `${baseKey}|${cropKey}|${options?.mask ?? 'rect'}`;
+
+    if (imageCache.has(cacheKey)) {
+      return imageCache.get(cacheKey) ?? null;
+    }
+
+    if (source.kind === 'zip') {
+      const cleanPath = source.path.replace(/^\/+/, '');
+      const entry =
+        meta.zip!.file(cleanPath) ??
+        Object.values(meta.zip!.files).find(
+          (f) => !f.dir && f.name.toLowerCase() === cleanPath.toLowerCase(),
+        );
+      if (!entry) {
+        imageCache.set(cacheKey, null);
+        return null;
+      }
+      rawBytes = await entry.async('uint8array');
+    } else {
+      rawBytes = source.bytes;
+    }
+
+    const mime = detectImageMime(rawBytes, hint);
+    const needsCanvasTransform = Boolean(
+      options?.crop ||
+        options?.mask === 'ellipse' ||
+        options?.mask === 'roundRect' ||
+        (mime !== 'image/png' && mime !== 'image/jpeg'),
+    );
+
+    let embedded: PDFImage | null = null;
+    try {
+      if (needsCanvasTransform) {
+        const raster = await rasterizeImageForPdf(rawBytes, mime, options);
+        if (raster) {
+          embedded =
+            raster.format === 'png'
+              ? await pdfDoc.embedPng(raster.bytes)
+              : await pdfDoc.embedJpg(raster.bytes);
+        }
+      }
+      if (!embedded && mime === 'image/png') {
+        embedded = await pdfDoc.embedPng(rawBytes);
+      } else if (!embedded && mime === 'image/jpeg') {
+        embedded = await pdfDoc.embedJpg(rawBytes);
+      }
+    } catch {
+      // Retry via canvas normalization if pdf-lib rejected an exotic PNG/JPEG variant (e.g. progressive/CMYK/16-bit)
+      try {
+        const raster = await rasterizeImageForPdf(rawBytes, mime, options);
+        if (raster) {
+          embedded =
+            raster.format === 'png'
+              ? await pdfDoc.embedPng(raster.bytes)
+              : await pdfDoc.embedJpg(raster.bytes);
+        }
+      } catch {
+        embedded = null;
+      }
+    }
+
+    imageCache.set(cacheKey, embedded);
+    if (embedded) embeddedImagesCount++;
+    return embedded;
+  };
+
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    const pageW = slide.widthPt || 720;
+    const pageH = slide.heightPt || 540;
+    const page = pdfDoc.addPage([pageW, pageH]);
+
+    // 1. Slide background (solid, gradient, or full-bleed background image)
+    const slideBgHex = slide.bgHex ?? '#ffffff';
+    page.drawRectangle({
+      x: 0,
+      y: 0,
+      width: pageW,
+      height: pageH,
+      color: hexToRgb(slideBgHex),
+    });
+
+    if (slide.bgGradient) {
+      const gradImg = await renderGradientToImage(pdfDoc, slide.bgGradient, pageW, pageH, 'rect');
+      if (gradImg) {
+        page.drawImage(gradImg, { x: 0, y: 0, width: pageW, height: pageH });
+      }
+    }
+
+    if (slide.bgImage) {
+      const bgImg = await resolveAndEmbedImage(slide.bgImage);
+      if (bgImg) {
+        page.drawImage(bgImg, { x: 0, y: 0, width: pageW, height: pageH });
+      }
+    }
+
+    const slideBgIsDark = !slide.bgImage && getHexLuminance(slideBgHex) < 0.36;
+    const marginX = Math.max(32, pageW * 0.055);
+    const defaultTextWidth = pageW - marginX * 2;
+    let flowCursorY = pageH - 52;
+
+    // 2. Render every element in exact painter's z-order
+    for (const el of slide.elements) {
+      if (el.kind === 'image') {
+        const embedded = await resolveAndEmbedImage(el.source, {
+          crop: el.crop,
+          mask: el.geometry,
+          cornerRadiusFrac: el.cornerRadiusFrac,
+        });
+        if (!embedded) continue;
+
+        const boxX = el.hasPosition ? el.xFrac * pageW : marginX;
+        const boxW = Math.max(12, el.hasPosition ? el.wFrac * pageW : defaultTextWidth * 0.65);
+        const boxH = Math.max(12, el.hasPosition ? el.hFrac * pageH : pageH * 0.48);
+        const boxYTop = el.hasPosition ? el.yFrac * pageH : pageH - flowCursorY;
+        const boxYBottom = pageH - boxYTop - boxH;
+
+        let drawX = boxX;
+        let drawY = boxYBottom;
+        let drawW = boxW;
+        let drawH = boxH;
+
+        if (el.fitMode === 'contain') {
+          const scale = Math.min(boxW / embedded.width, boxH / embedded.height);
+          drawW = embedded.width * scale;
+          drawH = embedded.height * scale;
+          drawX = boxX + (boxW - drawW) / 2;
+          drawY = boxYBottom + (boxH - drawH) / 2;
+        }
+
+        page.drawImage(embedded, {
+          x: drawX,
+          y: drawY,
+          width: drawW,
+          height: drawH,
+        });
+
+        if (el.borderHex && (el.borderWidthPt ?? 0) > 0) {
+          const bw = el.borderWidthPt ?? 1;
+          if (el.geometry === 'ellipse') {
+            page.drawEllipse({
+              x: drawX + drawW / 2,
+              y: drawY + drawH / 2,
+              xScale: drawW / 2,
+              yScale: drawH / 2,
+              borderColor: hexToRgb(el.borderHex),
+              borderWidth: bw,
+            });
+          } else if (el.geometry === 'roundRect') {
+            const path = buildRoundedRectSvgPath(
+              drawW,
+              drawH,
+              Math.min(drawW, drawH) * (el.cornerRadiusFrac ?? 0.14),
+            );
+            page.drawSvgPath(path, {
+              x: drawX,
+              y: drawY + drawH,
+              borderColor: hexToRgb(el.borderHex),
+              borderWidth: bw,
+            });
+          } else {
+            page.drawRectangle({
+              x: drawX,
+              y: drawY,
+              width: drawW,
+              height: drawH,
+              borderColor: hexToRgb(el.borderHex),
+              borderWidth: bw,
+            });
+          }
+        }
+
+        if (!el.hasPosition) {
+          flowCursorY = Math.min(flowCursorY, drawY - 14);
+        }
+        continue;
+      }
+
+      if (el.kind === 'table') {
+        flowCursorY = drawStyledSlideTable(
+          page,
+          el,
+          pageW,
+          pageH,
+          marginX,
+          defaultTextWidth,
+          flowCursorY,
+          regularFont,
+          boldFont,
+        );
+        continue;
+      }
+
+      // 3. Shape / Frame / Card / Line / TextBox
+      flowCursorY = await drawStyledSlideShape(
+        pdfDoc,
+        page,
+        el,
+        pageW,
+        pageH,
+        marginX,
+        defaultTextWidth,
+        flowCursorY,
+        slideBgIsDark,
+        pickFont,
+        resolveAndEmbedImage,
+      );
+    }
+
+    onProgress?.(10 + Math.round(((i + 1) / slides.length) * 85));
+    if (i % 6 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  const outBytes = await pdfDoc.save({ useObjectStreams: true });
+  onProgress?.(100);
+  const blob = new Blob(
+    [outBytes.buffer.slice(outBytes.byteOffset, outBytes.byteOffset + outBytes.byteLength) as ArrayBuffer],
+    { type: 'application/pdf' },
+  );
+  return makeResult(blob, `${baseName}.pdf`, {
+    originalBytes: meta.file.size,
+    pageCount: slides.length,
+    summary: `Converted ${slides.length} ${meta.label} slide(s)${
+      embeddedImagesCount > 0 ? ` and ${embeddedImagesCount} embedded image(s)` : ''
+    } to PDF with preserved layout and frames.`,
+  });
+}
+
+async function drawStyledSlideShape(
+  pdfDoc: PDFDocument,
+  page: PDFPage,
+  shape: SlideShapeElement,
+  pageW: number,
+  pageH: number,
+  marginX: number,
+  defaultTextWidth: number,
+  flowCursorY: number,
+  slideBgIsDark: boolean,
+  pickFont: (isBold?: boolean, isItalic?: boolean) => PDFFont,
+  resolveAndEmbedImage: (
+    source: SlideImageSource,
+    options?: { crop?: SlideImageCrop; mask?: 'rect' | 'roundRect' | 'ellipse'; cornerRadiusFrac?: number },
+  ) => Promise<PDFImage | null>,
+): Promise<number> {
+  const useExplicit = shape.hasPosition;
+  const boxX = useExplicit ? shape.xFrac * pageW : marginX;
+  const boxW = useExplicit ? Math.max(2, shape.wFrac * pageW) : defaultTextWidth;
+  const boxH = useExplicit ? Math.max(2, shape.hFrac * pageH) : Math.max(28, shape.hFrac * pageH);
+  const boxYTop = useExplicit ? shape.yFrac * pageH : pageH - flowCursorY;
+  const boxYBottom = pageH - boxYTop - boxH;
+
+  // Line / Connector element
+  if (shape.geometry === 'line') {
+    const strokeHex = shape.borderHex ?? shape.fillHex ?? '#334155';
+    const thickness = Math.max(0.6, shape.borderWidthPt ?? 1);
+    const startX = shape.flipH ? boxX + boxW : boxX;
+    const endX = shape.flipH ? boxX : boxX + boxW;
+    const startY = shape.flipV ? boxYBottom : boxYBottom + boxH;
+    const endY = shape.flipV ? boxYBottom + boxH : boxYBottom;
+    page.drawLine({
+      start: { x: startX, y: startY },
+      end: { x: endX, y: endY },
+      thickness,
+      color: hexToRgb(strokeHex),
+      opacity: shape.borderOpacity ?? 1,
+      dashArray: shape.borderDash ? [5, 3] : undefined,
+    });
+    return flowCursorY;
+  }
+
+  // Draw shape fill / gradient / image fill / border frame
+  const hasFill = Boolean(shape.fillHex);
+  const hasBorder = Boolean(shape.borderHex && (shape.borderWidthPt ?? 0) > 0);
+  const fillOpacity = shape.fillOpacity ?? 1;
+  const borderOpacity = shape.borderOpacity ?? 1;
+  const borderWidth = shape.borderWidthPt ?? 1;
+
+  if (shape.fillImage) {
+    const img = await resolveAndEmbedImage(shape.fillImage, {
+      crop: shape.fillImageCrop,
+      mask: shape.geometry === 'ellipse' || shape.geometry === 'roundRect' ? shape.geometry : 'rect',
+      cornerRadiusFrac: shape.cornerRadiusFrac,
+    });
+    if (img) {
+      page.drawImage(img, {
+        x: boxX,
+        y: boxYBottom,
+        width: boxW,
+        height: boxH,
+      });
+    }
+  } else if (shape.gradient) {
+    const gGeom =
+      shape.geometry === 'ellipse' || shape.geometry === 'roundRect' ? shape.geometry : 'rect';
+    const gradImg = await renderGradientToImage(
+      pdfDoc,
+      shape.gradient,
+      boxW,
+      boxH,
+      gGeom,
+      shape.cornerRadiusFrac,
+    );
+    if (gradImg) {
+      page.drawImage(gradImg, {
+        x: boxX,
+        y: boxYBottom,
+        width: boxW,
+        height: boxH,
+        opacity: fillOpacity,
+      });
+    } else if (hasFill) {
+      page.drawRectangle({
+        x: boxX,
+        y: boxYBottom,
+        width: boxW,
+        height: boxH,
+        color: hexToRgb(shape.fillHex!),
+        opacity: fillOpacity,
+      });
+    }
+  }
+
+  // Draw vector geometry (fill if no gradient/image filled it, plus border stroke)
+  const drawVectorFill = hasFill && !shape.gradient && !shape.fillImage;
+  if (drawVectorFill || hasBorder) {
+    if (shape.geometry === 'ellipse') {
+      page.drawEllipse({
+        x: boxX + boxW / 2,
+        y: boxYBottom + boxH / 2,
+        xScale: boxW / 2,
+        yScale: boxH / 2,
+        color: drawVectorFill ? hexToRgb(shape.fillHex!) : undefined,
+        opacity: drawVectorFill ? fillOpacity : undefined,
+        borderColor: hasBorder ? hexToRgb(shape.borderHex!) : undefined,
+        borderWidth: hasBorder ? borderWidth : undefined,
+        borderOpacity: hasBorder ? borderOpacity : undefined,
+      });
+    } else if (shape.geometry === 'roundRect') {
+      const r = Math.min(boxW, boxH) * (shape.cornerRadiusFrac ?? 0.14);
+      const path = buildRoundedRectSvgPath(boxW, boxH, r);
+      page.drawSvgPath(path, {
+        x: boxX,
+        y: boxYBottom + boxH,
+        color: drawVectorFill ? hexToRgb(shape.fillHex!) : undefined,
+        opacity: drawVectorFill ? fillOpacity : undefined,
+        borderColor: hasBorder ? hexToRgb(shape.borderHex!) : undefined,
+        borderWidth: hasBorder ? borderWidth : undefined,
+        borderOpacity: hasBorder ? borderOpacity : undefined,
+      });
+    } else if (shape.geometry === 'triangle') {
+      const triPath = `M ${boxW / 2} 0 L ${boxW} ${boxH} L 0 ${boxH} Z`;
+      page.drawSvgPath(triPath, {
+        x: boxX,
+        y: boxYBottom + boxH,
+        color: drawVectorFill ? hexToRgb(shape.fillHex!) : undefined,
+        opacity: drawVectorFill ? fillOpacity : undefined,
+        borderColor: hasBorder ? hexToRgb(shape.borderHex!) : undefined,
+        borderWidth: hasBorder ? borderWidth : undefined,
+        borderOpacity: hasBorder ? borderOpacity : undefined,
+      });
+    } else {
+      page.drawRectangle({
+        x: boxX,
+        y: boxYBottom,
+        width: boxW,
+        height: boxH,
+        color: drawVectorFill ? hexToRgb(shape.fillHex!) : undefined,
+        opacity: drawVectorFill ? fillOpacity : undefined,
+        borderColor: hasBorder ? hexToRgb(shape.borderHex!) : undefined,
+        borderWidth: hasBorder ? borderWidth : undefined,
+        borderOpacity: hasBorder ? borderOpacity : undefined,
+      });
+    }
+  }
+
+  if (shape.paragraphs.length === 0) {
+    return flowCursorY;
+  }
+
+  // Render text paragraphs inside the shape frame with alignment, vertical centering, and smart auto-fit
+  const cornerSafePad =
+    shape.geometry === 'roundRect'
+      ? Math.min(16, Math.max(9, Math.min(boxW, boxH) * (shape.cornerRadiusFrac ?? 0.14) * 0.42))
+      : 6;
+  const pad = shape.paddingPt
+    ? {
+        l: Math.max(shape.paddingPt.l, shape.geometry === 'roundRect' ? cornerSafePad : 0),
+        t: Math.max(shape.paddingPt.t, shape.geometry === 'roundRect' ? Math.round(cornerSafePad * 0.75) : 0),
+        r: Math.max(shape.paddingPt.r, shape.geometry === 'roundRect' ? cornerSafePad : 0),
+        b: Math.max(shape.paddingPt.b, shape.geometry === 'roundRect' ? Math.round(cornerSafePad * 0.75) : 0),
+      }
+    : {
+        l: cornerSafePad,
+        t: shape.geometry === 'roundRect' ? Math.round(cornerSafePad * 0.85) : 5,
+        r: cornerSafePad,
+        b: shape.geometry === 'roundRect' ? Math.round(cornerSafePad * 0.85) : 5,
+      };
+  const innerX = boxX + pad.l;
+  const innerW = Math.max(24, boxW - pad.l - pad.r);
+  const innerH = Math.max(12, boxH - pad.t - pad.b);
+
+  const shapeSurfaceDark = shape.fillHex
+    ? getHexLuminance(shape.fillHex) < 0.42
+    : shape.fillImage
+      ? true
+      : slideBgIsDark;
+
+  interface LaidOutLine {
+    text: string;
+    font: PDFFont;
+    size: number;
+    lineH: number;
+    colorHex: string;
+    align: 'left' | 'center' | 'right';
+    indent: number;
+    paraGapAfter: number;
+  }
+
+  const layoutAtScale = (scale: number): { lines: LaidOutLine[]; totalH: number } => {
+    const out: LaidOutLine[] = [];
+    let totalH = 0;
+
+    for (const para of shape.paragraphs) {
+      const baseSize = Math.max(7, Math.min(48, para.fontSizePt ?? (shape.isTitle ? 26 : 14)));
+      const size = Math.max(6.5, baseSize * scale);
+      const font = pickFont(para.isBold, para.isItalic);
+      const level = Math.max(0, Math.min(4, para.level ?? 0));
+      const indent = (para.isBullet ? 10 : 0) + level * 12;
+      const bulletPrefix = para.isBullet ? `${para.bulletChar ? sanitizeWinAnsi(para.bulletChar) : '\u2022'} ` : '';
+      const rawText = `${bulletPrefix}${para.text}`;
+      const wrapped = wrapTextToWidth(rawText, font, size, Math.max(20, innerW - indent));
+      const lineH = size * 1.28;
+      const paraGap = (shape.isTitle ? 6 : 4) * scale;
+      const colorHex = para.colorHex ?? (shapeSurfaceDark ? '#ffffff' : '#0f172a');
+      const align = para.align ?? 'left';
+
+      for (let li = 0; li < wrapped.length; li++) {
+        const gap = li === wrapped.length - 1 ? paraGap : 0;
+        out.push({
+          text: wrapped[li],
+          font,
+          size,
+          lineH,
+          colorHex,
+          align,
+          indent,
+          paraGapAfter: gap,
+        });
+        totalH += lineH + gap;
+      }
+    }
+    return { lines: out, totalH };
+  };
+
+  let laidOut = layoutAtScale(1);
+  if (useExplicit && laidOut.totalH > innerH * 1.06 && innerH > 18) {
+    // Gently shrink font up to 0.72x so wrapped text stays inside its card/frame cleanly
+    const ratio = Math.max(0.72, Math.sqrt(innerH / laidOut.totalH));
+    laidOut = layoutAtScale(ratio);
+  }
+
+  let cursorY: number;
+  if (useExplicit) {
+    const topY = boxYBottom + boxH - pad.t;
+    if (shape.verticalAlign === 'middle' && laidOut.totalH < innerH) {
+      cursorY = topY - (innerH - laidOut.totalH) / 2;
+    } else if (shape.verticalAlign === 'bottom' && laidOut.totalH < innerH) {
+      cursorY = topY - (innerH - laidOut.totalH);
+    } else {
+      cursorY = topY;
+    }
+  } else {
+    cursorY = flowCursorY;
+  }
+
+  const minY = useExplicit ? Math.max(6, boxYBottom - 6) : 22;
+
+  for (const line of laidOut.lines) {
+    const baselineY = cursorY - line.size;
+    if (baselineY < minY) break;
+
+    const textW = line.font.widthOfTextAtSize(line.text, line.size);
+    let drawX = innerX + line.indent;
+    if (line.align === 'center') {
+      drawX = innerX + Math.max(0, (innerW - textW) / 2);
+    } else if (line.align === 'right') {
+      drawX = innerX + Math.max(0, innerW - textW);
+    }
+
+    page.drawText(line.text, {
+      x: drawX,
+      y: baselineY,
+      size: line.size,
+      font: line.font,
+      color: hexToRgb(line.colorHex),
+    });
+    cursorY -= line.lineH + line.paraGapAfter;
+  }
+
+  return useExplicit ? flowCursorY : Math.min(flowCursorY, cursorY - 8);
+}
+
+function drawStyledSlideTable(
+  page: PDFPage,
+  table: SlideTableElement,
+  pageW: number,
+  pageH: number,
+  marginX: number,
+  defaultTextWidth: number,
+  flowCursorY: number,
+  regularFont: PDFFont,
+  boldFont: PDFFont,
+): number {
+  if (table.rows.length === 0) return flowCursorY;
+
+  const colCount = Math.max(1, ...table.rows.map((r) => r.length));
+  const useExplicit = table.hasPosition;
+  const tblX = useExplicit ? Math.max(8, table.xFrac * pageW) : marginX;
+  const tblW = useExplicit
+    ? Math.max(60, Math.min(pageW - tblX - 8, table.wFrac * pageW))
+    : defaultTextWidth;
+  const tblH = useExplicit ? Math.max(24, table.hFrac * pageH) : table.rows.length * 22;
+  let cursorY = useExplicit ? pageH - table.yFrac * pageH : Math.min(flowCursorY, pageH * 0.55);
+
+  const colWidths =
+    table.colWidthFracs && table.colWidthFracs.length === colCount
+      ? table.colWidthFracs.map((f) => f * tblW)
+      : new Array<number>(colCount).fill(tblW / colCount);
+
+  const rowH = Math.max(16, Math.min(34, tblH / table.rows.length));
+
+  for (let rIdx = 0; rIdx < table.rows.length; rIdx++) {
+    if (cursorY - rowH < 10) break;
+    const isHeader = rIdx === 0;
+    const row = table.rows[rIdx];
+    let cellX = tblX;
+
+    for (let cIdx = 0; cIdx < colCount; cIdx++) {
+      const colW = colWidths[cIdx] ?? tblW / colCount;
+      const cell = row[cIdx];
+      const cellFillHex =
+        cell?.fillHex ??
+        (isHeader ? '#1e293b' : rIdx % 2 === 1 ? '#f8fafc' : '#ffffff');
+
+      page.drawRectangle({
+        x: cellX,
+        y: cursorY - rowH,
+        width: colW,
+        height: rowH,
+        color: hexToRgb(cellFillHex),
+        borderColor: hexToRgb(table.borderHex ?? '#cbd5e1'),
+        borderWidth: 0.55,
+      });
+
+      const cellText = cell?.text ?? '';
+      if (cellText) {
+        const font = cell?.isBold || isHeader ? boldFont : regularFont;
+        const fSize = Math.max(7.5, Math.min(11, cell?.fontSizePt ?? 9));
+        const clipped = clipTextToWidth(cellText, font, fSize, Math.max(10, colW - 8));
+        const txtW = font.widthOfTextAtSize(clipped, fSize);
+        let drawX = cellX + 4;
+        if (cell?.align === 'center') drawX = cellX + Math.max(4, (colW - txtW) / 2);
+        else if (cell?.align === 'right') drawX = cellX + Math.max(4, colW - txtW - 4);
+
+        const defaultTxtHex = getHexLuminance(cellFillHex) < 0.42 ? '#ffffff' : '#0f172a';
+        page.drawText(clipped, {
+          x: drawX,
+          y: cursorY - rowH + Math.max(4, (rowH - fSize) / 2 + 1),
+          size: fSize,
+          font,
+          color: hexToRgb(cell?.textColorHex ?? defaultTxtHex),
+        });
+      }
+
+      cellX += colW;
+    }
+
+    cursorY -= rowH;
+  }
+
+  return useExplicit ? flowCursorY : Math.min(flowCursorY, cursorY - 12);
+}
+
+/**
+ * Converts a PowerPoint (.pptx / .pptm / .ppsx / .potx) presentation into a rich multi-page PDF
+ * preserving slide aspect ratio, theme/master/layout backgrounds & frames, grouped shapes,
+ * rounded cards, borders, cropped/masked images, positioned tables, and styled typography.
  */
 export async function pptxToPdf(
   file: File,
@@ -206,268 +1077,11 @@ export async function pptxToPdf(
 ): Promise<ToolResult> {
   onProgress?.(5);
   const zip = await JSZip.loadAsync(await file.arrayBuffer());
-
-  let slideWidthEmu = 12192000; // 16:9 default (960 pt)
-  let slideHeightEmu = 6858000; // 540 pt
-  const orderedSlidePaths: string[] = [];
-
-  const presXmlFile = zip.file('ppt/presentation.xml');
-  if (presXmlFile) {
-    const presXml = await presXmlFile.async('string');
-    const szMatch = /<p:sldSz\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/i.exec(presXml);
-    if (szMatch) {
-      const cx = Number.parseInt(szMatch[1], 10);
-      const cy = Number.parseInt(szMatch[2], 10);
-      if (cx > 1000000 && cy > 1000000) {
-        slideWidthEmu = cx;
-        slideHeightEmu = cy;
-      }
-    }
-
-    const presRelsFile = zip.file('ppt/_rels/presentation.xml.rels');
-    if (presRelsFile) {
-      const relMap = parseRelationshipMap(await presRelsFile.async('string'));
-      const sldIdRe = /<p:sldId\b[^>]*r:id="([^"]+)"/gi;
-      let m: RegExpExecArray | null;
-      while ((m = sldIdRe.exec(presXml)) !== null) {
-        const target = relMap.get(m[1]);
-        if (target) {
-          const fullPath = resolveZipTargetPath('ppt', target);
-          if (zip.file(fullPath)) orderedSlidePaths.push(fullPath);
-        }
-      }
-    }
+  const slides = await parsePptxArchive(zip);
+  if (slides.length === 0) {
+    throw new Error('No slides found inside this PowerPoint presentation.');
   }
-
-  // Fallback: discover ppt/slides/slideN.xml numerically
-  if (orderedSlidePaths.length === 0) {
-    const found: Array<{ num: number; path: string }> = [];
-    zip.forEach((relPath, entry) => {
-      if (entry.dir) return;
-      const m = /^ppt\/slides\/slide(\d+)\.xml$/i.exec(relPath);
-      if (m) found.push({ num: Number.parseInt(m[1], 10), path: relPath });
-    });
-    found.sort((a, b) => a.num - b.num);
-    orderedSlidePaths.push(...found.map((f) => f.path));
-  }
-
-  if (orderedSlidePaths.length === 0) {
-    throw new Error('No slides found inside this .pptx presentation.');
-  }
-
-  const pdfDoc = await PDFDocument.create();
-  const baseName = sanitizeBaseName(file.name);
-  pdfDoc.setTitle(baseName);
-  pdfDoc.setCreator('FolioPDF');
-
-  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  let embeddedImagesCount = 0;
-
-  for (let i = 0; i < orderedSlidePaths.length; i++) {
-    const slidePath = orderedSlidePaths[i];
-    const slideXml = await zip.file(slidePath)!.async('string');
-    const parsed = parsePptxSlideXml(slideXml, i + 1, slideWidthEmu, slideHeightEmu);
-
-    const page = pdfDoc.addPage([parsed.widthPt, parsed.heightPt]);
-    const pageW = parsed.widthPt;
-    const pageH = parsed.heightPt;
-
-    // Background fill
-    if (parsed.bgHex) {
-      page.drawRectangle({
-        x: 0,
-        y: 0,
-        width: pageW,
-        height: pageH,
-        color: hexToRgb(parsed.bgHex),
-      });
-    } else {
-      page.drawRectangle({
-        x: 0,
-        y: 0,
-        width: pageW,
-        height: pageH,
-        color: rgb(1, 1, 1),
-      });
-      // Subtle top accent bar for clean presentation framing
-      page.drawRectangle({
-        x: 0,
-        y: pageH - 5,
-        width: pageW,
-        height: 5,
-        color: rgb(0.88, 0.11, 0.28),
-      });
-    }
-
-    // Load slide relationships for embedded images
-    const slideFileName = slidePath.split('/').pop() ?? '';
-    const slideRelsPath = `ppt/slides/_rels/${slideFileName}.rels`;
-    const slideRelsFile = zip.file(slideRelsPath);
-    const slideRelMap = slideRelsFile
-      ? parseRelationshipMap(await slideRelsFile.async('string'))
-      : new Map<string, string>();
-
-    // Draw embedded pictures first (underneath text overlays)
-    for (const imgSpec of parsed.images) {
-      const target = slideRelMap.get(imgSpec.relId);
-      if (!target) continue;
-      const mediaPath = resolveZipTargetPath('ppt/slides', target);
-      const mediaEntry = zip.file(mediaPath);
-      if (!mediaEntry) continue;
-      const mediaBytes = await mediaEntry.async('uint8array');
-      const embedded = await embedZipMediaImage(pdfDoc, mediaBytes, mediaPath);
-      if (!embedded) continue;
-      embeddedImagesCount++;
-
-      const boxW = Math.max(40, imgSpec.wFrac * pageW);
-      const boxH = Math.max(30, imgSpec.hFrac * pageH);
-      const boxX = imgSpec.xFrac * pageW;
-      const boxYTop = imgSpec.yFrac * pageH;
-
-      // Preserve aspect ratio within shape box
-      const scale = Math.min(boxW / embedded.width, boxH / embedded.height);
-      const drawW = embedded.width * scale;
-      const drawH = embedded.height * scale;
-      const drawX = boxX + (boxW - drawW) / 2;
-      const drawY = pageH - boxYTop - boxH + (boxH - drawH) / 2;
-
-      page.drawImage(embedded, {
-        x: drawX,
-        y: Math.max(8, drawY),
-        width: drawW,
-        height: drawH,
-      });
-    }
-
-    // Determine whether shapes have explicit positions or need automatic vertical flow
-    let flowCursorY = pageH - 56;
-    const marginX = Math.max(36, pageW * 0.055);
-    const defaultTextWidth = pageW - marginX * 2;
-
-    // Sort unpositioned shapes so title comes first
-    const orderedShapes = [...parsed.shapes].sort((a, b) => {
-      if (a.isTitle !== b.isTitle) return a.isTitle ? -1 : 1;
-      return a.yFrac - b.yFrac;
-    });
-
-    for (const shape of orderedShapes) {
-      const useExplicit = shape.hasPosition;
-      const boxX = useExplicit ? Math.max(18, shape.xFrac * pageW) : marginX;
-      const boxW = useExplicit
-        ? Math.max(100, Math.min(pageW - boxX - 18, shape.wFrac * pageW))
-        : defaultTextWidth;
-      let cursorY = useExplicit
-        ? pageH - shape.yFrac * pageH - 18
-        : flowCursorY;
-
-      for (const para of shape.paragraphs) {
-        const fontSize = Math.max(
-          9,
-          Math.min(34, para.fontSizePt ?? (shape.isTitle ? 24 : 14)),
-        );
-        const font = para.isBold ? boldFont : regularFont;
-        const prefix = para.isBullet ? '* ' : '';
-        const textColor = para.colorHex
-          ? hexToRgb(para.colorHex)
-          : shape.isTitle
-            ? rgb(0.06, 0.09, 0.16)
-            : rgb(0.15, 0.21, 0.3);
-
-        const wrapped = wrapTextToWidth(`${prefix}${para.text}`, font, fontSize, boxW);
-        const lineHeight = fontSize * 1.32;
-
-        for (const line of wrapped) {
-          if (cursorY < 24) break;
-          page.drawText(line, {
-            x: para.isBullet ? boxX + 8 : boxX,
-            y: cursorY,
-            size: fontSize,
-            font,
-            color: textColor,
-          });
-          cursorY -= lineHeight;
-        }
-        cursorY -= shape.isTitle ? 8 : 5;
-      }
-
-      if (!useExplicit) {
-        flowCursorY = Math.min(flowCursorY, cursorY - 6);
-      }
-    }
-
-    // Draw extracted slide tables cleanly
-    let tableCursorY = Math.min(flowCursorY, pageH * 0.45);
-    for (const table of parsed.tables) {
-      if (table.length === 0) continue;
-      const colCount = Math.max(1, ...table.map((r) => r.length));
-      const tblW = defaultTextWidth;
-      const colW = tblW / colCount;
-      const rowH = 20;
-
-      for (let rIdx = 0; rIdx < table.length; rIdx++) {
-        if (tableCursorY - rowH < 24) break;
-        const isHeader = rIdx === 0;
-        page.drawRectangle({
-          x: marginX,
-          y: tableCursorY - rowH,
-          width: tblW,
-          height: rowH,
-          color: isHeader
-            ? rgb(0.12, 0.16, 0.23)
-            : rIdx % 2 === 1
-              ? rgb(0.97, 0.98, 0.99)
-              : rgb(1, 1, 1),
-          borderColor: rgb(0.82, 0.85, 0.9),
-          borderWidth: 0.6,
-        });
-
-        const row = table[rIdx];
-        for (let cIdx = 0; cIdx < colCount; cIdx++) {
-          const cellVal = sanitizeWinAnsi(row[cIdx] ?? '');
-          const font = isHeader ? boldFont : regularFont;
-          const clipped = clipTextToWidth(cellVal, font, 9, colW - 8);
-          page.drawText(clipped, {
-            x: marginX + cIdx * colW + 4,
-            y: tableCursorY - rowH + 6,
-            size: 9,
-            font,
-            color: isHeader ? rgb(1, 1, 1) : rgb(0.12, 0.16, 0.23),
-          });
-        }
-        tableCursorY -= rowH;
-      }
-      tableCursorY -= 12;
-    }
-
-    // Subtle slide number indicator in bottom-right corner
-    const slideBadge = `${i + 1} / ${orderedSlidePaths.length}`;
-    const badgeW = regularFont.widthOfTextAtSize(slideBadge, 9);
-    page.drawText(slideBadge, {
-      x: pageW - badgeW - 18,
-      y: 12,
-      size: 9,
-      font: regularFont,
-      color: rgb(0.45, 0.5, 0.58),
-    });
-
-    onProgress?.(10 + Math.round(((i + 1) / orderedSlidePaths.length) * 85));
-    if (i % 8 === 0) await new Promise((r) => setTimeout(r, 0));
-  }
-
-  const outBytes = await pdfDoc.save({ useObjectStreams: true });
-  onProgress?.(100);
-  const blob = new Blob([outBytes.buffer.slice(outBytes.byteOffset, outBytes.byteOffset + outBytes.byteLength) as ArrayBuffer], {
-    type: 'application/pdf',
-  });
-  return makeResult(blob, `${baseName}.pdf`, {
-    originalBytes: file.size,
-    pageCount: orderedSlidePaths.length,
-    summary: `Converted ${orderedSlidePaths.length} PowerPoint slide(s)${
-      embeddedImagesCount > 0 ? ` and ${embeddedImagesCount} embedded image(s)` : ''
-    } to PDF.`,
-  });
+  return renderRichSlidesToPdf(slides, { file, label: 'PowerPoint', zip }, onProgress);
 }
 
 function clipTextToWidth(text: string, font: PDFFont, size: number, maxWidth: number): string {
@@ -942,181 +1556,18 @@ export async function pdfToCsv(
   });
 }
 
-/** Shared slide renderer used by legacy .ppt and OpenDocument .odp presentations. */
-async function renderParsedSlidesToPdf(
-  slides: ParsedPptxSlide[],
-  meta: {
-    file: File;
-    label: string;
-    zip?: JSZip;
-  },
-  onProgress?: (pct: number) => void,
-): Promise<ToolResult> {
-  if (slides.length === 0) {
-    throw new Error(`No slide content could be extracted from "${meta.file.name}".`);
-  }
-
-  const pdfDoc = await PDFDocument.create();
-  const baseName = sanitizeBaseName(meta.file.name);
-  pdfDoc.setTitle(baseName);
-  pdfDoc.setCreator('FolioPDF');
-
-  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  let embeddedImages = 0;
-
-  for (let i = 0; i < slides.length; i++) {
-    const slide = slides[i];
-    const pageW = slide.widthPt || 720;
-    const pageH = slide.heightPt || 540;
-    const page = pdfDoc.addPage([pageW, pageH]);
-
-    page.drawRectangle({
-      x: 0,
-      y: 0,
-      width: pageW,
-      height: pageH,
-      color: slide.bgHex ? hexToRgb(slide.bgHex) : rgb(1, 1, 1),
-    });
-    if (!slide.bgHex) {
-      page.drawRectangle({
-        x: 0,
-        y: pageH - 5,
-        width: pageW,
-        height: 5,
-        color: rgb(0.88, 0.11, 0.28),
-      });
-    }
-
-    // Optional zip-embedded media (for .odp)
-    if (meta.zip) {
-      for (const imgSpec of slide.images) {
-        const mediaEntry = meta.zip.file(imgSpec.relId.replace(/^\/+/, ''));
-        if (!mediaEntry) continue;
-        const embedded = await embedZipMediaImage(
-          pdfDoc,
-          await mediaEntry.async('uint8array'),
-          imgSpec.relId,
-        );
-        if (!embedded) continue;
-        embeddedImages++;
-        const boxW = Math.max(40, imgSpec.wFrac * pageW);
-        const boxH = Math.max(30, imgSpec.hFrac * pageH);
-        const scale = Math.min(boxW / embedded.width, boxH / embedded.height);
-        const drawW = embedded.width * scale;
-        const drawH = embedded.height * scale;
-        page.drawImage(embedded, {
-          x: imgSpec.xFrac * pageW,
-          y: Math.max(20, pageH - imgSpec.yFrac * pageH - drawH),
-          width: drawW,
-          height: drawH,
-        });
-      }
-    }
-
-    const marginX = Math.max(36, pageW * 0.06);
-    const maxW = pageW - marginX * 2;
-    let cursorY = pageH - 56;
-
-    for (const shape of slide.shapes) {
-      for (const para of shape.paragraphs) {
-        const fontSize = Math.max(10, Math.min(30, para.fontSizePt ?? (shape.isTitle ? 24 : 14)));
-        const font = para.isBold ? boldFont : regularFont;
-        const prefix = para.isBullet ? '* ' : '';
-        const wrapped = wrapTextToWidth(`${prefix}${para.text}`, font, fontSize, maxW);
-        const lineH = fontSize * 1.35;
-        for (const line of wrapped) {
-          if (cursorY < 26) break;
-          page.drawText(line, {
-            x: para.isBullet ? marginX + 10 : marginX,
-            y: cursorY,
-            size: fontSize,
-            font,
-            color: shape.isTitle ? rgb(0.06, 0.09, 0.16) : rgb(0.15, 0.21, 0.3),
-          });
-          cursorY -= lineH;
-        }
-        cursorY -= shape.isTitle ? 10 : 5;
-      }
-      cursorY -= 6;
-    }
-
-    // Slide tables
-    for (const table of slide.tables) {
-      if (table.length === 0 || cursorY < 50) continue;
-      const colCount = Math.max(1, ...table.map((r) => r.length));
-      const colW = maxW / colCount;
-      const rowH = 20;
-      for (let rIdx = 0; rIdx < table.length; rIdx++) {
-        if (cursorY - rowH < 24) break;
-        const isHeader = rIdx === 0;
-        page.drawRectangle({
-          x: marginX,
-          y: cursorY - rowH,
-          width: maxW,
-          height: rowH,
-          color: isHeader
-            ? rgb(0.12, 0.16, 0.23)
-            : rIdx % 2 === 1
-              ? rgb(0.97, 0.98, 0.99)
-              : rgb(1, 1, 1),
-          borderColor: rgb(0.84, 0.87, 0.91),
-          borderWidth: 0.5,
-        });
-        for (let cIdx = 0; cIdx < colCount; cIdx++) {
-          const val = clipTextToWidth(table[rIdx][cIdx] ?? '', isHeader ? boldFont : regularFont, 9, colW - 8);
-          page.drawText(val, {
-            x: marginX + cIdx * colW + 4,
-            y: cursorY - rowH + 6,
-            size: 9,
-            font: isHeader ? boldFont : regularFont,
-            color: isHeader ? rgb(1, 1, 1) : rgb(0.12, 0.16, 0.23),
-          });
-        }
-        cursorY -= rowH;
-      }
-      cursorY -= 10;
-    }
-
-    const badge = `${i + 1} / ${slides.length}`;
-    page.drawText(badge, {
-      x: pageW - regularFont.widthOfTextAtSize(badge, 9) - 18,
-      y: 12,
-      size: 9,
-      font: regularFont,
-      color: rgb(0.45, 0.5, 0.58),
-    });
-
-    onProgress?.(10 + Math.round(((i + 1) / slides.length) * 85));
-  }
-
-  const outBytes = await pdfDoc.save({ useObjectStreams: true });
-  onProgress?.(100);
-  const blob = new Blob([outBytes.buffer.slice(outBytes.byteOffset, outBytes.byteOffset + outBytes.byteLength) as ArrayBuffer], {
-    type: 'application/pdf',
-  });
-  return makeResult(blob, `${baseName}.pdf`, {
-    originalBytes: meta.file.size,
-    pageCount: slides.length,
-    summary: `Converted ${slides.length} ${meta.label} slide(s)${
-      embeddedImages > 0 ? ` and ${embeddedImages} image(s)` : ''
-    } to PDF.`,
-  });
-}
-
-/** Converts legacy PowerPoint 97–2003 (.ppt) binary presentations into PDF. */
+/** Converts legacy PowerPoint 97–2003 (.ppt) binary presentations into rich PDF slides. */
 export async function legacyPptToPdf(
   file: File,
   onProgress?: (pct: number) => void,
 ): Promise<ToolResult> {
   onProgress?.(8);
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const slides = extractSlidesFromLegacyPpt(bytes);
-  return renderParsedSlidesToPdf(slides, { file, label: 'PowerPoint (.ppt)' }, onProgress);
+  const slides = extractRichSlidesFromLegacyPpt(bytes);
+  return renderRichSlidesToPdf(slides, { file, label: 'PowerPoint (.ppt)' }, onProgress);
 }
 
-/** Converts OpenDocument Presentation (.odp) files into PDF. */
+/** Converts OpenDocument Presentation (.odp) files into rich positioned PDF slides. */
 export async function odpToPdf(
   file: File,
   onProgress?: (pct: number) => void,
@@ -1127,8 +1578,10 @@ export async function odpToPdf(
   if (!contentFile) {
     throw new Error('Could not find content.xml inside this .odp presentation.');
   }
-  const slides = parseOdpContentXml(await contentFile.async('string'));
-  return renderParsedSlidesToPdf(slides, { file, label: 'OpenDocument (.odp)', zip }, onProgress);
+  const stylesFile = zip.file('styles.xml');
+  const stylesXml = stylesFile ? await stylesFile.async('string') : undefined;
+  const slides = parseRichOdpXml(await contentFile.async('string'), stylesXml);
+  return renderRichSlidesToPdf(slides, { file, label: 'OpenDocument (.odp)', zip }, onProgress);
 }
 
 /** Shared structured document + tables -> crisp vector A4 PDF renderer. */

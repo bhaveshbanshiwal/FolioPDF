@@ -24,14 +24,17 @@ import {
 } from './preflight';
 import {
   extractBlocksFromLegacyDoc,
+  extractRichSlidesFromLegacyPpt,
   extractSheetsFromLegacyXls,
   extractSlidesFromLegacyPpt,
   parseEnhancedDocxXml,
   parseOdpContentXml,
   parseOdtContentXml,
   parseOle2Streams,
+  parseRichOdpXml,
   parseRtfToBlocks,
 } from './legacyOfficeUtils';
+import { parsePptxArchive } from './pptxParser';
 import {
   buildEditablePptxBlob,
   buildXlsxBlob,
@@ -561,3 +564,255 @@ test('Legacy Office (.ppt, .xls, .doc), RTF, ODT, ODP, and enhanced DOCX parsers
   assert.equal(docx.blocks[1].type, 'bullet');
   assert.deepEqual(docx.tables[0], [['Col1', 'Col2']]);
 });
+
+function buildMultiStreamOle2(streams: Array<{ name: string; data: Uint8Array }>): Uint8Array {
+  const sectorSize = 512;
+  const streamMeta = streams.map((s) => ({
+    name: s.name,
+    data: s.data,
+    sectors: Math.max(1, Math.ceil(s.data.length / sectorSize)),
+  }));
+  const totalDataSectors = streamMeta.reduce((sum, m) => sum + m.sectors, 0);
+  const totalSectors = 2 + totalDataSectors; // sector 0 = FAT, sector 1 = Dir
+  const buf = new Uint8Array((1 + totalSectors) * sectorSize);
+  const dv = new DataView(buf.buffer);
+
+  buf.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+  dv.setUint16(24, 0x003e, true);
+  dv.setUint16(26, 0x0003, true);
+  dv.setUint16(28, 0xfffe, true);
+  dv.setUint16(30, 9, true);
+  dv.setUint16(32, 6, true);
+  dv.setUint32(44, 1, true);
+  dv.setUint32(48, 1, true);
+  dv.setUint32(56, 0, true);
+  dv.setUint32(60, 0xfffffffe, true);
+  dv.setUint32(68, 0xfffffffe, true);
+  dv.setUint32(76, 0, true);
+  for (let i = 1; i < 109; i++) dv.setUint32(76 + i * 4, 0xffffffff, true);
+
+  const fatOff = sectorSize;
+  for (let i = 0; i < 128; i++) dv.setUint32(fatOff + i * 4, 0xffffffff, true);
+  dv.setUint32(fatOff + 0 * 4, 0xfffffffd, true);
+  dv.setUint32(fatOff + 1 * 4, 0xfffffffe, true);
+
+  const dirOff = 2 * sectorSize;
+  const writeDirName = (entryBase: number, name: string) => {
+    for (let i = 0; i < name.length; i++) dv.setUint16(entryBase + i * 2, name.charCodeAt(i), true);
+    dv.setUint16(entryBase + name.length * 2, 0, true);
+    dv.setUint16(entryBase + 64, (name.length + 1) * 2, true);
+  };
+  writeDirName(dirOff, 'Root Entry');
+  buf[dirOff + 66] = 5;
+  dv.setUint32(dirOff + 116, 0xfffffffe, true);
+
+  let nextSec = 2;
+  for (let idx = 0; idx < streamMeta.length; idx++) {
+    const m = streamMeta[idx];
+    const startSec = nextSec;
+    for (let s = 0; s < m.sectors; s++) {
+      dv.setUint32(
+        fatOff + (startSec + s) * 4,
+        s + 1 < m.sectors ? startSec + s + 1 : 0xfffffffe,
+        true,
+      );
+    }
+    const eOff = dirOff + (idx + 1) * 128;
+    writeDirName(eOff, m.name);
+    buf[eOff + 66] = 2;
+    dv.setUint32(eOff + 116, startSec, true);
+    dv.setUint32(eOff + 120, m.data.length, true);
+    buf.set(m.data, (1 + startSec) * sectorSize);
+    nextSec += m.sectors;
+  }
+
+  return buf;
+}
+
+test('Rich presentation parsers preserve layout, frames, colors, grouped transforms, and images across PPTX, legacy PPT, and ODP', async () => {
+  // 1. Rich PPTX with theme color, Slide Master decorative bar, Slide Layout placeholder xfrm, grouped shape, cropped image, and positioned table
+  const zip = new JSZip();
+  zip.file(
+    'ppt/presentation.xml',
+    `<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>`,
+  );
+  zip.file(
+    'ppt/_rels/presentation.xml.rels',
+    `<Relationships><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>`,
+  );
+  zip.file(
+    'ppt/theme/theme1.xml',
+    `<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="Test"><a:dk1><a:srgbClr val="0F172A"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:accent1><a:srgbClr val="1D4ED8"/></a:accent1></a:clrScheme></a:themeElements></a:theme>`,
+  );
+  zip.file(
+    'ppt/slideMasters/slideMaster1.xml',
+    `<p:sldMaster><p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="F8FAFC"/></a:solidFill></p:bgPr></p:bg><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="TopBar"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="12192000" cy="457200"/></a:xfrm><a:prstGeom prst="rect"/><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></p:spPr></p:sp></p:spTree></p:cSld><p:clrMap bg1="lt1" tx1="dk1" accent1="accent1"/></p:sldMaster>`,
+  );
+  zip.file(
+    'ppt/slideLayouts/slideLayout1.xml',
+    `<p:sldLayout><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="TitlePh"/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="609600" y="685800"/><a:ext cx="10972800" cy="914400"/></a:xfrm></p:spPr></p:sp></p:spTree></p:cSld></p:sldLayout>`,
+  );
+  zip.file(
+    'ppt/slideLayouts/_rels/slideLayout1.xml.rels',
+    `<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>`,
+  );
+  zip.file(
+    'ppt/slides/slide1.xml',
+    `<p:sld><p:cSld><p:spTree>
+      <p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:p><a:r><a:t>Inherited Position Title</a:t></a:r></a:p></p:txBody></p:sp>
+      <p:grpSp>
+        <p:grpSpPr><a:xfrm><a:off x="609600" y="2057400"/><a:ext cx="4876800" cy="3429000"/><a:chOff x="0" y="0"/><a:chExt cx="1000" cy="1000"/></a:xfrm></p:grpSpPr>
+        <p:sp><p:nvSpPr><p:cNvPr id="3" name="Card"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="EFF6FF"/></a:solidFill><a:ln w="19050"><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:ln></p:spPr><p:txBody><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1600" b="1"/><a:t>Grouped Card Frame</a:t></a:r></a:p></p:txBody></p:sp>
+      </p:grpSp>
+      <p:pic><p:nvPicPr><p:cNvPr id="4" name="HeroImg"/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/><a:srcRect l="10000" t="0" r="10000" b="0"/></p:blipFill><p:spPr><a:xfrm><a:off x="6096000" y="2057400"/><a:ext cx="5486400" cy="3429000"/></a:xfrm><a:prstGeom prst="roundRect"/></p:spPr></p:pic>
+    </p:spTree></p:cSld></p:sld>`,
+  );
+  zip.file(
+    'ppt/slides/_rels/slide1.xml.rels',
+    `<Relationships>
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+      <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+    </Relationships>`,
+  );
+  zip.file('ppt/media/image1.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+  const pptxSlides = await parsePptxArchive(zip);
+  assert.equal(pptxSlides.length, 1);
+  assert.equal(pptxSlides[0].bgHex?.toLowerCase(), '#f8fafc');
+  // Master bar + Title (inherited pos!) + Grouped rounded card + Cropped image = 4 z-ordered elements
+  assert.equal(pptxSlides[0].elements.length, 4);
+  const masterBar = pptxSlides[0].elements[0];
+  assert.equal(masterBar.kind, 'shape');
+  assert.equal(masterBar.fillHex?.toLowerCase(), '#1d4ed8');
+  const titleEl = pptxSlides[0].elements[1];
+  assert.equal(titleEl.kind, 'shape');
+  assert.equal(titleEl.hasPosition, true);
+  assert.ok(Math.abs(titleEl.xFrac - 0.05) < 0.005);
+  const groupedCard = pptxSlides[0].elements[2];
+  assert.equal(groupedCard.kind, 'shape');
+  assert.equal(groupedCard.geometry, 'roundRect');
+  assert.equal(groupedCard.fillHex?.toLowerCase(), '#eff6ff');
+  assert.equal(groupedCard.borderHex?.toLowerCase(), '#1d4ed8');
+  assert.ok(Math.abs(groupedCard.wFrac - 0.4) < 0.01);
+  const heroPic = pptxSlides[0].elements[3];
+  assert.equal(heroPic.kind, 'image');
+  assert.equal(heroPic.geometry, 'roundRect');
+  assert.ok(heroPic.crop && Math.abs(heroPic.crop.l - 0.1) < 0.001);
+
+  // 2. Rich Legacy .ppt OLE2 binary with Escher frame + Pictures stream PNG blip + ClientAnchor coords
+  const makeRec = (verInst: number, recType: number, body: Uint8Array) => {
+    const out = new Uint8Array(8 + body.length);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, verInst, true);
+    dv.setUint16(2, recType, true);
+    dv.setUint32(4, body.length, true);
+    out.set(body, 8);
+    return out;
+  };
+  const concat = (...parts: Uint8Array[]) => {
+    const total = parts.reduce((s, p) => s + p.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+    return out;
+  };
+
+  // Pictures stream with 1 PNG blip (0xF01E: 16-byte UID + 1-byte tag + PNG signature)
+  const fakePng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  const blipBody = new Uint8Array(17 + fakePng.length);
+  blipBody.set(fakePng, 17);
+  const picturesStream = makeRec(0x6e00, 0xf01e, blipBody);
+
+  // Escher SpContainer #1: Rounded card with fill #1E40AF, border #93C5FD, anchor (top=432, left=576, right=2880, bottom=2160)
+  const sp1Fsp = new Uint8Array(8);
+  new DataView(sp1Fsp.buffer).setUint32(0, 1025, true);
+  const sp1Fopt = new Uint8Array(4 * 6);
+  const f1dv = new DataView(sp1Fopt.buffer);
+  f1dv.setUint16(0, 0x0181, true); f1dv.setUint32(2, 0x00af401e, true); // RGB(30,64,175) = #1e40af
+  f1dv.setUint16(6, 0x01bf, true); f1dv.setUint32(8, 0x00100010, true); // fFilled=true
+  f1dv.setUint16(12, 0x01c0, true); f1dv.setUint32(14, 0x00fdc593, true); // RGB(147,197,253) = #93c5fd
+  f1dv.setUint16(18, 0x01ff, true); f1dv.setUint32(20, 0x00080008, true); // fLine=true
+  const sp1Anchor = new Uint8Array(8);
+  const a1dv = new DataView(sp1Anchor.buffer);
+  a1dv.setInt16(0, 432, true); // top
+  a1dv.setInt16(2, 576, true); // left
+  a1dv.setInt16(4, 2880, true); // right
+  a1dv.setInt16(6, 2160, true); // bottom
+  const sp1Txt = makeRec(0x0000, 0x0fa8, new TextEncoder().encode('Escher Card Title'));
+  const sp1 = makeRec(
+    0x000f,
+    0xf004,
+    concat(
+      makeRec(2 << 4, 0xf00a, sp1Fsp), // shapeType=2 (roundRect)
+      makeRec((4 << 4) | 3, 0xf00b, sp1Fopt),
+      makeRec(0x0000, 0xf010, sp1Anchor),
+      makeRec(0x000f, 0xf00d, sp1Txt),
+    ),
+  );
+
+  // Escher SpContainer #2: PictureFrame (shapeType 75) referencing pib=1
+  const sp2Fopt = new Uint8Array(6);
+  const f2dv = new DataView(sp2Fopt.buffer);
+  f2dv.setUint16(0, 0x0104, true); f2dv.setUint32(2, 1, true); // pib = 1
+  const sp2Anchor = new Uint8Array(8);
+  const a2dv = new DataView(sp2Anchor.buffer);
+  a2dv.setInt16(0, 432, true);
+  a2dv.setInt16(2, 3168, true);
+  a2dv.setInt16(4, 5184, true);
+  a2dv.setInt16(6, 3456, true);
+  const sp2 = makeRec(
+    0x000f,
+    0xf004,
+    concat(
+      makeRec(75 << 4, 0xf00a, sp1Fsp),
+      makeRec((1 << 4) | 3, 0xf00b, sp2Fopt),
+      makeRec(0x0000, 0xf010, sp2Anchor),
+    ),
+  );
+
+  const spgr = makeRec(0x000f, 0xf003, concat(sp1, sp2));
+  const dg = makeRec(0x000f, 0xf002, spgr);
+  const drawing = makeRec(0x000f, 0x040c, dg);
+  const slideRec = makeRec(0x000f, 0x03ee, drawing);
+
+  const richPptOle = buildMultiStreamOle2([
+    { name: 'PowerPoint Document', data: slideRec },
+    { name: 'Pictures', data: picturesStream },
+  ]);
+  const legacyRichSlides = extractRichSlidesFromLegacyPpt(richPptOle);
+  assert.equal(legacyRichSlides.length, 1);
+  assert.equal(legacyRichSlides[0].elements.length, 2);
+  const legCard = legacyRichSlides[0].elements[0];
+  assert.equal(legCard.kind, 'shape');
+  assert.equal(legCard.geometry, 'roundRect');
+  assert.equal(legCard.fillHex?.toLowerCase(), '#1e40af');
+  assert.equal(legCard.borderHex?.toLowerCase(), '#93c5fd');
+  assert.ok(Math.abs(legCard.xFrac - 0.1) < 0.005);
+  assert.equal(legCard.paragraphs[0].text, 'Escher Card Title');
+  const legImg = legacyRichSlides[0].elements[1];
+  assert.equal(legImg.kind, 'image');
+  assert.equal(legImg.source.kind, 'bytes');
+  assert.equal(legImg.source.mime, 'image/png');
+  assert.ok(Math.abs(legImg.xFrac - 0.55) < 0.005);
+
+  // 3. Rich ODP preserving real svg:x/y/width/height + styles.xml page dimensions + fills
+  const odpRich = parseRichOdpXml(
+    `<office:document-content><office:automatic-styles><style:style style:name="gr1"><style:graphic-properties draw:fill-color="#DBEAFE" svg:stroke-color="#1D4ED8"/></style:style></office:automatic-styles><office:body><office:presentation><draw:page><draw:custom-shape draw:style-name="gr1" svg:x="2.8cm" svg:y="2.1cm" svg:width="14cm" svg:height="8.4cm"><text:p>Positioned ODP Box</text:p></draw:custom-shape><draw:frame svg:x="17.5cm" svg:y="2.1cm" svg:width="8.4cm" svg:height="8.4cm"><draw:image xlink:href="Pictures/pic1.png"/></draw:frame></draw:page></office:presentation></office:body></office:document-content>`,
+    `<office:document-styles><office:automatic-styles><style:page-layout style:name="PM1"><style:page-layout-properties fo:page-width="28cm" fo:page-height="21cm"/></style:page-layout></office:automatic-styles></office:document-styles>`,
+  );
+  assert.equal(odpRich.length, 1);
+  assert.equal(odpRich[0].elements.length, 2);
+  const odpBox = odpRich[0].elements[0];
+  assert.equal(odpBox.kind, 'shape');
+  assert.equal(odpBox.hasPosition, true);
+  assert.ok(Math.abs(odpBox.xFrac - 0.1) < 0.005);
+  assert.equal(odpBox.fillHex?.toLowerCase(), '#dbeafe');
+  const odpImg = odpRich[0].elements[1];
+  assert.equal(odpImg.kind, 'image');
+  assert.equal(odpImg.hasPosition, true);
+  assert.ok(Math.abs(odpImg.xFrac - 0.625) < 0.005);
+});
+

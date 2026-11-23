@@ -171,8 +171,8 @@ export function ConverterAndImagesTool({
 
     const inputDescription = isPresentationInput
       ? ext === 'ppt'
-        ? 'Parses legacy PowerPoint 97–2003 binary slide records (.ppt) into clean landscape vector PDF slides locally.'
-        : 'Preserves slide aspect ratio (16:9 / 4:3), backgrounds, text shapes, slide tables, and embedded images in a vector PDF.'
+        ? 'Parses legacy PowerPoint 97–2003 (.ppt) slides including Escher frames, fills, borders, color schemes, slide backgrounds, positioned text, and embedded Pictures stream images.'
+        : 'Preserves slide aspect ratio, theme & master/layout backgrounds, decorative frames, grouped shapes, rounded cards, borders, cropped/masked images, and positioned tables.'
       : isSpreadsheetInput
         ? ext === 'xls'
           ? 'Parses legacy Excel 97–2003 (.xls) workbooks (BIFF8 binary or HTML/XML exports) into styled multi-page PDF tables.'
