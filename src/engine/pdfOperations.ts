@@ -35,10 +35,17 @@ import {
   type StructuredTextBlock,
 } from '../utils/pdfUtils';
 import {
+  enhancedDocxToPdf,
+  epubToPdf,
+  legacyDocToPdf,
+  legacyPptToPdf,
+  odpToPdf,
+  odtToPdf,
   pdfToCsv,
   pdfToPptx,
   pdfToXlsx,
   pptxToPdf,
+  rtfToPdf,
   spreadsheetToPdf,
 } from './officeConverter';
 import {
@@ -2410,34 +2417,42 @@ export async function convertWithPdfConverter(
   const base = sanitizeBaseName(first.name);
 
   if (targetFormat === 'pdf') {
-    // Convert Images, PPTX, Sheets (XLSX/ODS/CSV/TSV), DOCX, TXT, MD, or HTML to PDF
+    // Convert Presentations, Docs, Spreadsheets, E-books, Webpages, Text, or Images to PDF
     const ext = first.name.toLowerCase().split('.').pop() ?? '';
-    if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
+    if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif'].includes(ext)) {
       return imagesToPdf(files, 'a4', 'portrait', 36, onProgress);
     }
-    if (ext === 'pptx') {
+    if (['pptx', 'pptm', 'ppsx', 'potx'].includes(ext)) {
       return pptxToPdf(first, onProgress);
     }
-    if (['xlsx', 'ods', 'csv', 'tsv'].includes(ext)) {
+    if (ext === 'ppt') {
+      return legacyPptToPdf(first, onProgress);
+    }
+    if (ext === 'odp') {
+      return odpToPdf(first, onProgress);
+    }
+    if (['xlsx', 'xlsm', 'xltx', 'xls', 'ods', 'csv', 'tsv'].includes(ext)) {
       return spreadsheetToPdf(first, options?.sheetOrientation ?? 'auto', onProgress);
     }
-    if (ext === 'ppt' || ext === 'xls' || ext === 'doc') {
-      throw new Error(
-        `Legacy binary .${ext} (Office 97–2003) files cannot be parsed directly in the browser. Save/export as .${ext}x (or .csv) and drop it here.`,
-      );
+    if (['docx', 'docm', 'dotx'].includes(ext)) {
+      return enhancedDocxToPdf(first, onProgress);
     }
-    if (ext === 'docx') {
-      const text = await extractTextFromBasicDocx(first);
-      const blocks = parseMarkdownToBlocks(text);
-      return createPdfFromStructuredBlocks(blocks, {
-        pageSize: 'a4',
-        marginPt: 48,
-        fileName: `${base}.pdf`,
-        title: base,
-      });
+    if (ext === 'doc') {
+      return legacyDocToPdf(first, onProgress);
+    }
+    if (ext === 'odt') {
+      return odtToPdf(first, onProgress);
+    }
+    if (ext === 'rtf') {
+      return rtfToPdf(first, onProgress);
+    }
+    if (ext === 'epub') {
+      return epubToPdf(first, onProgress);
     }
     const rawText = await first.text();
-    const isHtml = ext === 'html' || ext === 'htm' || /<\s*(html|body|p|h1|div)\b/i.test(rawText);
+    const isHtml =
+      ['html', 'htm', 'xhtml', 'mht', 'mhtml'].includes(ext) ||
+      /<\s*(html|body|p|h1|div)\b/i.test(rawText);
     const blocks = isHtml ? stripHtmlToBlocks(rawText) : parseMarkdownToBlocks(rawText);
     return createPdfFromStructuredBlocks(blocks, {
       pageSize: 'a4',
@@ -2523,25 +2538,6 @@ function escapeXml(str: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
-}
-
-async function extractTextFromBasicDocx(file: File): Promise<string> {
-  const zip = await JSZip.loadAsync(await file.arrayBuffer());
-  const xmlFile = zip.file('word/document.xml');
-  if (!xmlFile) {
-    throw new Error('Could not find word/document.xml inside this .docx archive.');
-  }
-  const xml = await xmlFile.async('string');
-  return xml
-    .replace(/<\/w:p>/g, '\n\n')
-    .replace(/<w:tab\/>/g, '  ')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .trim();
 }
 
 async function buildBasicDocxBlob(pages: Array<{ pageNumber: number; text: string }>): Promise<Blob> {

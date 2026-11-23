@@ -154,8 +154,36 @@ export function ConverterAndImagesTool({
   if (toolId === 'converter') {
     const file = files[0];
     const ext = file.name.toLowerCase().split('.').pop() ?? '';
-    const isSpreadsheetInput = ['xlsx', 'ods', 'csv', 'tsv'].includes(ext);
-    const isPptxInput = ext === 'pptx';
+    const isSpreadsheetInput = ['xlsx', 'xlsm', 'xltx', 'xls', 'ods', 'csv', 'tsv'].includes(ext);
+    const isPresentationInput = ['pptx', 'pptm', 'ppsx', 'potx', 'ppt', 'odp'].includes(ext);
+    const isWordOrDocInput = ['docx', 'docm', 'dotx', 'doc', 'odt', 'rtf', 'epub'].includes(ext);
+    const isLegacyBinary = ['ppt', 'doc', 'xls'].includes(ext);
+
+    const inputHeading = firstIsPdf
+      ? 'Convert PDF to another format'
+      : isPresentationInput
+        ? `Convert Presentation (.${ext}) to PDF`
+        : isSpreadsheetInput
+          ? `Convert Spreadsheet (.${ext}) to PDF`
+          : isWordOrDocInput
+            ? `Convert Document (.${ext}) to PDF`
+            : `Convert file (.${ext || 'file'}) to PDF`;
+
+    const inputDescription = isPresentationInput
+      ? ext === 'ppt'
+        ? 'Parses legacy PowerPoint 97–2003 binary slide records (.ppt) into clean landscape vector PDF slides locally.'
+        : 'Preserves slide aspect ratio (16:9 / 4:3), backgrounds, text shapes, slide tables, and embedded images in a vector PDF.'
+      : isSpreadsheetInput
+        ? ext === 'xls'
+          ? 'Parses legacy Excel 97–2003 (.xls) workbooks (BIFF8 binary or HTML/XML exports) into styled multi-page PDF tables.'
+          : 'Parses every worksheet into styled multi-page PDF tables with proportional column widths and repeating headers.'
+        : isWordOrDocInput
+          ? ext === 'doc'
+            ? 'Extracts paragraphs from legacy Word 97–2003 (.doc) binary, RTF, or HTML-saved Word files into a clean vector PDF.'
+            : ext === 'epub'
+              ? 'Reads EPUB book spine chapters in order and formats them into a readable multi-page vector PDF.'
+              : 'Preserves headings, paragraphs, bullet lists, and tables in a clean A4 vector PDF.'
+          : `Will convert ${files.length} file(s) cleanly into a standard PDF document.`;
 
     const effectiveTarget: PdfConverterTarget = firstIsPdf
       ? convertTarget === 'pptx' && pptxExportMode === 'visual'
@@ -168,13 +196,7 @@ export function ConverterAndImagesTool({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-display font-semibold text-slate-900 dark:text-white">
-              {firstIsPdf
-                ? 'Convert PDF to another format'
-                : isPptxInput
-                  ? 'Convert PowerPoint (.pptx) to PDF'
-                  : isSpreadsheetInput
-                    ? `Convert Spreadsheet (.${ext}) to PDF`
-                    : 'Convert file to PDF'}
+              {inputHeading}
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
               Input: <span className="font-mono">{file.name}</span> ({formatBytes(file.size)})
@@ -265,13 +287,13 @@ export function ConverterAndImagesTool({
           </div>
         ) : (
           <div className="space-y-3">
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              {isPptxInput
-                ? 'Preserves slide aspect ratio (16:9 / 4:3), backgrounds, positioned text, slide tables, and embedded PNG/JPEG images in a vector PDF.'
-                : isSpreadsheetInput
-                  ? 'Parses every worksheet into styled multi-page PDF tables with proportional column widths and repeating headers.'
-                  : `Will convert ${files.length} file(s) cleanly into a standard PDF document.`}
-            </p>
+            <p className="text-xs text-slate-600 dark:text-slate-400">{inputDescription}</p>
+
+            {isLegacyBinary && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200/80 dark:border-amber-900/60 rounded-lg px-3 py-2">
+                Legacy Office 97–2003 binary (.{ext}) detected: text, slides, and cell values are extracted locally in-browser. For pixel-exact charts or custom themes, save as .{ext}x in Office/LibreOffice.
+              </p>
+            )}
 
             {isSpreadsheetInput && (
               <div className="flex flex-wrap items-center gap-2.5">

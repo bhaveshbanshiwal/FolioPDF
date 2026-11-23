@@ -23,6 +23,16 @@ import {
   assessWorkloadRisk,
 } from './preflight';
 import {
+  extractBlocksFromLegacyDoc,
+  extractSheetsFromLegacyXls,
+  extractSlidesFromLegacyPpt,
+  parseEnhancedDocxXml,
+  parseOdpContentXml,
+  parseOdtContentXml,
+  parseOle2Streams,
+  parseRtfToBlocks,
+} from './legacyOfficeUtils';
+import {
   buildEditablePptxBlob,
   buildXlsxBlob,
   columnIndexToExcelRef,
@@ -388,7 +398,7 @@ test('PPTX utilities build valid OOXML deck and parse slide shapes, tables, and 
   ]);
   assert.equal(rowsToCsv(rows), 'Item,Cost\r\n"Widget, Pro",299');
 
-  // Preflight accepts .pptx & .xlsx cleanly without caution, while flagging legacy .xls
+  // Preflight accepts .pptx, .xlsx, .ppt, .doc, .xls cleanly while flagging unknown binary files
   const desktop = buildDeviceProfile({ deviceMemoryGb: 16, hardwareConcurrency: 12, isMobile: false, jsHeapLimitBytes: null });
   const pptxRisk = assessWorkloadRisk({
     probes: [{ fileName: 'deck.pptx', sizeBytes: 250_000, detectedType: 'zip-or-docx', isEncryptedPdf: false, hasValidPdfHeader: false }],
@@ -400,10 +410,154 @@ test('PPTX utilities build valid OOXML deck and parse slide shapes, tables, and 
   assert.equal(pptxRisk.issues.length, 0);
 
   const legacyXlsRisk = assessWorkloadRisk({
-    probes: [{ fileName: 'old.xls', sizeBytes: 120_000, detectedType: 'unknown', isEncryptedPdf: false, hasValidPdfHeader: false }],
+    probes: [{ fileName: 'old.xls', sizeBytes: 120_000, detectedType: 'ole2', isEncryptedPdf: false, hasValidPdfHeader: false }],
     toolId: 'converter',
     otherTabsBytes: 0,
     device: desktop,
   });
-  assert.equal(legacyXlsRisk.level, 'caution');
+  assert.equal(legacyXlsRisk.level, 'ok');
+
+  const unknownBinRisk = assessWorkloadRisk({
+    probes: [{ fileName: 'archive.bin', sizeBytes: 120_000, detectedType: 'unknown', isEncryptedPdf: false, hasValidPdfHeader: false }],
+    toolId: 'converter',
+    otherTabsBytes: 0,
+    device: desktop,
+  });
+  assert.equal(unknownBinRisk.level, 'caution');
+});
+
+function buildMinimalOle2File(streamName: string, streamData: Uint8Array): Uint8Array {
+  // 512-byte sectors: sector 0 = FAT, sector 1 = Directory, sectors 2..N = stream data
+  const streamSectors = Math.max(1, Math.ceil(streamData.length / 512));
+  const totalSectors = 2 + streamSectors;
+  const buf = new Uint8Array(512 + totalSectors * 512);
+  const dv = new DataView(buf.buffer);
+
+  // Header magic: D0 CF 11 E0 A1 B1 1A E1
+  buf.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+  dv.setUint16(24, 0x003e, true);
+  dv.setUint16(26, 0x0003, true);
+  dv.setUint16(28, 0xfffe, true);
+  dv.setUint16(30, 9, true); // 512-byte sectors
+  dv.setUint16(32, 6, true); // 64-byte mini sectors
+  dv.setUint32(44, 1, true); // 1 FAT sector
+  dv.setUint32(48, 1, true); // firstDirSector = 1
+  dv.setUint32(56, 0, true); // miniCutoffSize = 0 (always regular FAT)
+  dv.setUint32(60, 0xfffffffe, true); // no MiniFAT
+  dv.setUint32(68, 0xfffffffe, true); // no extra DIFAT
+  dv.setUint32(76, 0, true); // FAT is in sector 0
+  for (let i = 1; i < 109; i++) dv.setUint32(76 + i * 4, 0xffffffff, true);
+
+  // Sector 0: FAT
+  const fatOff = 512;
+  for (let i = 0; i < 128; i++) dv.setUint32(fatOff + i * 4, 0xffffffff, true);
+  dv.setUint32(fatOff + 0 * 4, 0xfffffffd, true); // FATSECT
+  dv.setUint32(fatOff + 1 * 4, 0xfffffffe, true); // Dir EOF
+  for (let s = 0; s < streamSectors; s++) {
+    dv.setUint32(
+      fatOff + (2 + s) * 4,
+      s + 1 < streamSectors ? 2 + s + 1 : 0xfffffffe,
+      true,
+    );
+  }
+
+  // Sector 1: Directory (entry 0 = Root Entry, entry 1 = streamName)
+  const dirOff = 512 + 512;
+  const writeDirName = (entryBase: number, name: string) => {
+    for (let i = 0; i < name.length; i++) {
+      dv.setUint16(entryBase + i * 2, name.charCodeAt(i), true);
+    }
+    dv.setUint16(entryBase + name.length * 2, 0, true);
+    dv.setUint16(entryBase + 64, (name.length + 1) * 2, true);
+  };
+  writeDirName(dirOff, 'Root Entry');
+  buf[dirOff + 66] = 5; // Root Storage
+  dv.setUint32(dirOff + 116, 0xfffffffe, true);
+
+  const e1 = dirOff + 128;
+  writeDirName(e1, streamName);
+  buf[e1 + 66] = 2; // Stream
+  dv.setUint32(e1 + 116, 2, true); // startSec = 2
+  dv.setUint32(e1 + 120, streamData.length, true);
+
+  // Sectors 2..N: stream payload
+  buf.set(streamData, 512 + 2 * 512);
+  return buf;
+}
+
+test('Legacy Office (.ppt, .xls, .doc), RTF, ODT, ODP, and enhanced DOCX parsers extract clean structured data', () => {
+  // 1. Build a real OLE2 .ppt binary with Slide container (0x03EE) + TextBytesAtom (0x0FA8)
+  const encoder = new TextEncoder();
+  const titleBytes = encoder.encode('Legacy Slide Deck');
+  const bodyBytes = encoder.encode('Point one\rPoint two');
+  const atom1Len = 8 + titleBytes.length;
+  const atom2Len = 8 + bodyBytes.length;
+  const slidePayloadLen = atom1Len + atom2Len;
+  const pptStream = new Uint8Array(8 + slidePayloadLen);
+  const pdv = new DataView(pptStream.buffer);
+  pdv.setUint16(0, 0x000f, true); // container version
+  pdv.setUint16(2, 0x03ee, true); // RT_Slide
+  pdv.setUint32(4, slidePayloadLen, true);
+  // Atom 1: TextBytesAtom
+  pdv.setUint16(8, 0x0000, true);
+  pdv.setUint16(10, 0x0fa8, true);
+  pdv.setUint32(12, titleBytes.length, true);
+  pptStream.set(titleBytes, 16);
+  // Atom 2: TextBytesAtom
+  const a2 = 8 + atom1Len;
+  pdv.setUint16(a2, 0x0000, true);
+  pdv.setUint16(a2 + 2, 0x0fa8, true);
+  pdv.setUint32(a2 + 4, bodyBytes.length, true);
+  pptStream.set(bodyBytes, a2 + 8);
+
+  const olePpt = buildMinimalOle2File('PowerPoint Document', pptStream);
+  const headerProbe = inspectFileHeaderBytes(olePpt.subarray(0, 64), null, 'legacy.ppt', olePpt.length);
+  assert.equal(headerProbe.detectedType, 'ole2');
+  const streams = parseOle2Streams(olePpt);
+  assert.ok(streams.has('PowerPoint Document'));
+  const slides = extractSlidesFromLegacyPpt(olePpt);
+  assert.equal(slides.length, 1);
+  assert.equal(slides[0].shapes[0].paragraphs[0].text, 'Legacy Slide Deck');
+  assert.equal(slides[0].shapes[1].paragraphs[0].text, 'Point one');
+
+  // 2. Legacy .xls (SpreadsheetML XML & HTML table variants)
+  const xmlXls = encoder.encode(
+    '<Workbook><Worksheet ss:Name="Sales"><Table><Row><Cell><Data>Product</Data></Cell><Cell><Data>Units</Data></Cell></Row><Row><Cell><Data>Pro</Data></Cell><Cell><Data>42</Data></Cell></Row></Table></Worksheet></Workbook>',
+  );
+  const xlsSheets = extractSheetsFromLegacyXls(xmlXls, 'sales');
+  assert.equal(xlsSheets.length, 1);
+  assert.equal(xlsSheets[0].name, 'Sales');
+  assert.deepEqual(xlsSheets[0].rows, [
+    ['Product', 'Units'],
+    ['Pro', '42'],
+  ]);
+
+  // 3. RTF & RTF-disguised .doc
+  const rtfStr = '{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}Hello \\b World\\b0\\par Second line with \\\'26 ampersand}';
+  const rtfBlocks = parseRtfToBlocks(rtfStr);
+  assert.equal(rtfBlocks.length, 2);
+  assert.equal(rtfBlocks[0].text, 'Hello World');
+  assert.equal(rtfBlocks[1].text, 'Second line with & ampersand');
+  const docFromRtf = extractBlocksFromLegacyDoc(encoder.encode(rtfStr));
+  assert.equal(docFromRtf[0].text, 'Hello World');
+
+  // 4. ODT, ODP, and Enhanced DOCX (headings + bullets + tables)
+  const odt = parseOdtContentXml(
+    '<office:text><text:h text:outline-level="1">Spec</text:h><text:p>Body text</text:p><table:table><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell><table:table-cell><text:p>B</text:p></table:table-cell></table:table-row></table:table></office:text>',
+  );
+  assert.equal(odt.blocks[0].type, 'heading');
+  assert.equal(odt.tables.length, 1);
+
+  const odp = parseOdpContentXml(
+    '<draw:page draw:name="page1"><draw:frame presentation:class="title"><draw:text-box><text:p>ODP Heading</text:p></draw:text-box></draw:frame></draw:page>',
+  );
+  assert.equal(odp.length, 1);
+  assert.equal(odp[0].shapes[0].paragraphs[0].text, 'ODP Heading');
+
+  const docx = parseEnhancedDocxXml(
+    '<w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Project Brief</w:t></w:r></w:p><w:p><w:pPr><w:numPr/></w:pPr><w:r><w:t>Bullet item</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Col1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col2</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body>',
+  );
+  assert.equal(docx.blocks[0].type, 'heading');
+  assert.equal(docx.blocks[1].type, 'bullet');
+  assert.deepEqual(docx.tables[0], [['Col1', 'Col2']]);
 });

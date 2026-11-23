@@ -91,7 +91,16 @@ export function buildDeviceProfile(params: {
 export interface FileHeaderProbe {
   fileName: string;
   sizeBytes: number;
-  detectedType: 'pdf' | 'png' | 'jpeg' | 'webp' | 'zip-or-docx' | 'text' | 'empty' | 'unknown';
+  detectedType:
+    | 'pdf'
+    | 'png'
+    | 'jpeg'
+    | 'webp'
+    | 'zip-or-docx'
+    | 'ole2'
+    | 'text'
+    | 'empty'
+    | 'unknown';
   isEncryptedPdf: boolean;
   hasValidPdfHeader: boolean;
 }
@@ -176,7 +185,7 @@ export function inspectFileHeaderBytes(
     };
   }
 
-  // ZIP / DOCX: PK\x03\x04
+  // ZIP / OOXML / ODF / EPUB: PK\x03\x04
   if (
     headBytes.length >= 4 &&
     headBytes[0] === 0x50 &&
@@ -188,6 +197,27 @@ export function inspectFileHeaderBytes(
       fileName,
       sizeBytes: totalSizeBytes,
       detectedType: 'zip-or-docx',
+      isEncryptedPdf: false,
+      hasValidPdfHeader: false,
+    };
+  }
+
+  // Legacy Microsoft Office OLE2 / CFBF (.ppt, .doc, .xls): D0 CF 11 E0 A1 B1 1A E1
+  if (
+    headBytes.length >= 8 &&
+    headBytes[0] === 0xd0 &&
+    headBytes[1] === 0xcf &&
+    headBytes[2] === 0x11 &&
+    headBytes[3] === 0xe0 &&
+    headBytes[4] === 0xa1 &&
+    headBytes[5] === 0xb1 &&
+    headBytes[6] === 0x1a &&
+    headBytes[7] === 0xe1
+  ) {
+    return {
+      fileName,
+      sizeBytes: totalSizeBytes,
+      detectedType: 'ole2',
       isEncryptedPdf: false,
       hasValidPdfHeader: false,
     };
@@ -320,14 +350,59 @@ export function assessWorkloadRisk(input: {
       }
     } else if (tool.expectedKind === 'converter') {
       const ext = probe.fileName.toLowerCase().split('.').pop() ?? '';
-      if (['doc', 'ppt', 'xls'].includes(ext)) {
+      const supportedConverterExts = new Set([
+        'pdf',
+        'doc',
+        'docx',
+        'docm',
+        'dotx',
+        'odt',
+        'rtf',
+        'epub',
+        'ppt',
+        'pptx',
+        'pptm',
+        'ppsx',
+        'potx',
+        'odp',
+        'xls',
+        'xlsx',
+        'xlsm',
+        'xltx',
+        'ods',
+        'csv',
+        'tsv',
+        'txt',
+        'md',
+        'markdown',
+        'log',
+        'json',
+        'xml',
+        'yaml',
+        'yml',
+        'html',
+        'htm',
+        'xhtml',
+        'mht',
+        'mhtml',
+        'png',
+        'jpg',
+        'jpeg',
+        'webp',
+        'gif',
+        'bmp',
+        'svg',
+        'avif',
+      ]);
+      if (ext && !supportedConverterExts.has(ext) && probe.detectedType === 'unknown') {
         issues.push({
-          id: `office-limit-${probe.fileName}`,
+          id: `converter-unknown-${probe.fileName}`,
           severity: 'caution',
           fileName: probe.fileName,
-          title: 'Legacy binary Office 97–2003 format',
-          detail: `Legacy binary ".${ext}" files cannot be parsed directly in the browser.`,
-          actionHint: `Save or export as .${ext}x (or .csv / .ods / PDF) first — modern .docx, .pptx, and .xlsx files convert locally.`,
+          title: `Unrecognized binary format (.${ext})`,
+          detail: `".${ext}" is not a standard document, slide, spreadsheet, web, or image format.`,
+          actionHint:
+            'Supported formats: PDF, Word (.doc/.docx/.odt/.rtf), Slides (.ppt/.pptx/.odp), Sheets (.xls/.xlsx/.ods/.csv/.tsv), EPUB, HTML/MD/TXT, and Images.',
         });
       }
     }

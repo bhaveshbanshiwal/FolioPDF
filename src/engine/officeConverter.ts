@@ -2,11 +2,21 @@ import { PDFDocument, type PDFFont, type PDFImage, type PDFPage, rgb, StandardFo
 import JSZip from 'jszip';
 import type { ToolResult } from '../types/tools';
 import {
+  extractBlocksFromLegacyDoc,
+  extractSheetsFromLegacyXls,
+  extractSlidesFromLegacyPpt,
+  parseEnhancedDocxXml,
+  parseOdpContentXml,
+  parseOdtContentXml,
+  parseRtfToBlocks,
+} from '../utils/legacyOfficeUtils';
+import {
   buildEditablePptxBlob,
   buildVisualPptxBlob,
   buildXlsxBlob,
   decodeXmlEntities,
   groupPdfLinesIntoSheetRows,
+  type ParsedPptxSlide,
   type ParsedSheet,
   parseOdsContentXml,
   parsePptxSlideXml,
@@ -15,7 +25,12 @@ import {
   parseXlsxWorksheetXml,
   rowsToCsv,
 } from '../utils/officeUtils';
-import { parseCsvRows, sanitizeBaseName } from '../utils/pdfUtils';
+import {
+  parseCsvRows,
+  sanitizeBaseName,
+  stripHtmlToBlocks,
+  type StructuredTextBlock,
+} from '../utils/pdfUtils';
 import {
   closePdfJsDocument,
   extractAllPagesEditableTextLines,
@@ -498,7 +513,18 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSheet[]> {
     return sheets;
   }
 
-  if (ext === 'xlsx') {
+  if (ext === 'xls') {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const sheets = extractSheetsFromLegacyXls(bytes, sanitizeBaseName(file.name));
+    if (sheets.length === 0) {
+      throw new Error(
+        'Could not extract worksheet cells from this legacy .xls file. It may be password-protected or corrupted.',
+      );
+    }
+    return sheets;
+  }
+
+  if (ext === 'xlsx' || ext === 'xlsm' || ext === 'xltx') {
     const zip = await JSZip.loadAsync(await file.arrayBuffer());
     const sharedStringsFile = zip.file('xl/sharedStrings.xml');
     const sharedStrings = sharedStringsFile
@@ -555,12 +581,14 @@ export async function parseSpreadsheetFile(file: File): Promise<ParsedSheet[]> {
     }
 
     if (sheets.length === 0) {
-      throw new Error('No populated worksheets found inside this .xlsx workbook.');
+      throw new Error(`No populated worksheets found inside this .${ext} workbook.`);
     }
     return sheets;
   }
 
-  throw new Error(`Unsupported spreadsheet format ".${ext}". Use .xlsx, .ods, .csv, or .tsv.`);
+  throw new Error(
+    `Unsupported spreadsheet format ".${ext}". Use .xlsx, .xlsm, .xltx, .xls, .ods, .csv, or .tsv.`,
+  );
 }
 
 /**
@@ -913,3 +941,443 @@ export async function pdfToCsv(
     summary: `Extracted ${allRows.length} structured row(s) from ${numPages} PDF page(s) to CSV.`,
   });
 }
+
+/** Shared slide renderer used by legacy .ppt and OpenDocument .odp presentations. */
+async function renderParsedSlidesToPdf(
+  slides: ParsedPptxSlide[],
+  meta: {
+    file: File;
+    label: string;
+    zip?: JSZip;
+  },
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  if (slides.length === 0) {
+    throw new Error(`No slide content could be extracted from "${meta.file.name}".`);
+  }
+
+  const pdfDoc = await PDFDocument.create();
+  const baseName = sanitizeBaseName(meta.file.name);
+  pdfDoc.setTitle(baseName);
+  pdfDoc.setCreator('FolioPDF');
+
+  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  let embeddedImages = 0;
+
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    const pageW = slide.widthPt || 720;
+    const pageH = slide.heightPt || 540;
+    const page = pdfDoc.addPage([pageW, pageH]);
+
+    page.drawRectangle({
+      x: 0,
+      y: 0,
+      width: pageW,
+      height: pageH,
+      color: slide.bgHex ? hexToRgb(slide.bgHex) : rgb(1, 1, 1),
+    });
+    if (!slide.bgHex) {
+      page.drawRectangle({
+        x: 0,
+        y: pageH - 5,
+        width: pageW,
+        height: 5,
+        color: rgb(0.88, 0.11, 0.28),
+      });
+    }
+
+    // Optional zip-embedded media (for .odp)
+    if (meta.zip) {
+      for (const imgSpec of slide.images) {
+        const mediaEntry = meta.zip.file(imgSpec.relId.replace(/^\/+/, ''));
+        if (!mediaEntry) continue;
+        const embedded = await embedZipMediaImage(
+          pdfDoc,
+          await mediaEntry.async('uint8array'),
+          imgSpec.relId,
+        );
+        if (!embedded) continue;
+        embeddedImages++;
+        const boxW = Math.max(40, imgSpec.wFrac * pageW);
+        const boxH = Math.max(30, imgSpec.hFrac * pageH);
+        const scale = Math.min(boxW / embedded.width, boxH / embedded.height);
+        const drawW = embedded.width * scale;
+        const drawH = embedded.height * scale;
+        page.drawImage(embedded, {
+          x: imgSpec.xFrac * pageW,
+          y: Math.max(20, pageH - imgSpec.yFrac * pageH - drawH),
+          width: drawW,
+          height: drawH,
+        });
+      }
+    }
+
+    const marginX = Math.max(36, pageW * 0.06);
+    const maxW = pageW - marginX * 2;
+    let cursorY = pageH - 56;
+
+    for (const shape of slide.shapes) {
+      for (const para of shape.paragraphs) {
+        const fontSize = Math.max(10, Math.min(30, para.fontSizePt ?? (shape.isTitle ? 24 : 14)));
+        const font = para.isBold ? boldFont : regularFont;
+        const prefix = para.isBullet ? '* ' : '';
+        const wrapped = wrapTextToWidth(`${prefix}${para.text}`, font, fontSize, maxW);
+        const lineH = fontSize * 1.35;
+        for (const line of wrapped) {
+          if (cursorY < 26) break;
+          page.drawText(line, {
+            x: para.isBullet ? marginX + 10 : marginX,
+            y: cursorY,
+            size: fontSize,
+            font,
+            color: shape.isTitle ? rgb(0.06, 0.09, 0.16) : rgb(0.15, 0.21, 0.3),
+          });
+          cursorY -= lineH;
+        }
+        cursorY -= shape.isTitle ? 10 : 5;
+      }
+      cursorY -= 6;
+    }
+
+    // Slide tables
+    for (const table of slide.tables) {
+      if (table.length === 0 || cursorY < 50) continue;
+      const colCount = Math.max(1, ...table.map((r) => r.length));
+      const colW = maxW / colCount;
+      const rowH = 20;
+      for (let rIdx = 0; rIdx < table.length; rIdx++) {
+        if (cursorY - rowH < 24) break;
+        const isHeader = rIdx === 0;
+        page.drawRectangle({
+          x: marginX,
+          y: cursorY - rowH,
+          width: maxW,
+          height: rowH,
+          color: isHeader
+            ? rgb(0.12, 0.16, 0.23)
+            : rIdx % 2 === 1
+              ? rgb(0.97, 0.98, 0.99)
+              : rgb(1, 1, 1),
+          borderColor: rgb(0.84, 0.87, 0.91),
+          borderWidth: 0.5,
+        });
+        for (let cIdx = 0; cIdx < colCount; cIdx++) {
+          const val = clipTextToWidth(table[rIdx][cIdx] ?? '', isHeader ? boldFont : regularFont, 9, colW - 8);
+          page.drawText(val, {
+            x: marginX + cIdx * colW + 4,
+            y: cursorY - rowH + 6,
+            size: 9,
+            font: isHeader ? boldFont : regularFont,
+            color: isHeader ? rgb(1, 1, 1) : rgb(0.12, 0.16, 0.23),
+          });
+        }
+        cursorY -= rowH;
+      }
+      cursorY -= 10;
+    }
+
+    const badge = `${i + 1} / ${slides.length}`;
+    page.drawText(badge, {
+      x: pageW - regularFont.widthOfTextAtSize(badge, 9) - 18,
+      y: 12,
+      size: 9,
+      font: regularFont,
+      color: rgb(0.45, 0.5, 0.58),
+    });
+
+    onProgress?.(10 + Math.round(((i + 1) / slides.length) * 85));
+  }
+
+  const outBytes = await pdfDoc.save({ useObjectStreams: true });
+  onProgress?.(100);
+  const blob = new Blob([outBytes.buffer.slice(outBytes.byteOffset, outBytes.byteOffset + outBytes.byteLength) as ArrayBuffer], {
+    type: 'application/pdf',
+  });
+  return makeResult(blob, `${baseName}.pdf`, {
+    originalBytes: meta.file.size,
+    pageCount: slides.length,
+    summary: `Converted ${slides.length} ${meta.label} slide(s)${
+      embeddedImages > 0 ? ` and ${embeddedImages} image(s)` : ''
+    } to PDF.`,
+  });
+}
+
+/** Converts legacy PowerPoint 97–2003 (.ppt) binary presentations into PDF. */
+export async function legacyPptToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(8);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const slides = extractSlidesFromLegacyPpt(bytes);
+  return renderParsedSlidesToPdf(slides, { file, label: 'PowerPoint (.ppt)' }, onProgress);
+}
+
+/** Converts OpenDocument Presentation (.odp) files into PDF. */
+export async function odpToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(8);
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const contentFile = zip.file('content.xml');
+  if (!contentFile) {
+    throw new Error('Could not find content.xml inside this .odp presentation.');
+  }
+  const slides = parseOdpContentXml(await contentFile.async('string'));
+  return renderParsedSlidesToPdf(slides, { file, label: 'OpenDocument (.odp)', zip }, onProgress);
+}
+
+/** Shared structured document + tables -> crisp vector A4 PDF renderer. */
+async function renderDocumentBlocksAndTablesToPdf(
+  blocks: StructuredTextBlock[],
+  tables: string[][][],
+  file: File,
+  label: string,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  if (blocks.length === 0 && tables.length === 0) {
+    throw new Error(`No readable content was found inside "${file.name}".`);
+  }
+
+  const pdfDoc = await PDFDocument.create();
+  const baseName = sanitizeBaseName(file.name);
+  pdfDoc.setTitle(baseName);
+  pdfDoc.setCreator('FolioPDF');
+
+  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const pageW = 595.28;
+  const pageH = 841.89;
+  const margin = 46;
+  const contentW = pageW - margin * 2;
+
+  let page = pdfDoc.addPage([pageW, pageH]);
+  let cursorY = pageH - margin;
+
+  const ensureSpace = (needed: number) => {
+    if (cursorY - needed < margin) {
+      page = pdfDoc.addPage([pageW, pageH]);
+      cursorY = pageH - margin;
+    }
+  };
+
+  for (let i = 0; i < blocks.length; i++) {
+    const blk = blocks[i];
+    if (blk.type === 'divider') {
+      ensureSpace(16);
+      page.drawLine({
+        start: { x: margin, y: cursorY - 6 },
+        end: { x: pageW - margin, y: cursorY - 6 },
+        thickness: 0.7,
+        color: rgb(0.82, 0.85, 0.9),
+      });
+      cursorY -= 16;
+      continue;
+    }
+
+    const isHeading = blk.type === 'heading';
+    const isSub = blk.type === 'subheading';
+    const isBullet = blk.type === 'bullet';
+    const fontSize = isHeading ? 18 : isSub ? 13.5 : 10.5;
+    const font = isHeading || isSub ? boldFont : regularFont;
+    const lineH = fontSize * 1.42;
+    const prefix = isBullet ? '* ' : '';
+    const indent = isBullet ? 12 : 0;
+
+    const wrapped = wrapTextToWidth(`${prefix}${blk.text}`, font, fontSize, contentW - indent);
+    if (isHeading) cursorY -= 4;
+    for (const line of wrapped) {
+      ensureSpace(lineH);
+      page.drawText(line, {
+        x: margin + indent,
+        y: cursorY - fontSize,
+        size: fontSize,
+        font,
+        color: isHeading
+          ? rgb(0.06, 0.09, 0.16)
+          : isSub
+            ? rgb(0.15, 0.21, 0.3)
+            : rgb(0.18, 0.23, 0.31),
+      });
+      cursorY -= lineH;
+    }
+    cursorY -= isHeading ? 8 : isSub ? 5 : 4;
+
+    if (i % 50 === 0) onProgress?.(10 + Math.round((i / Math.max(1, blocks.length)) * 65));
+  }
+
+  // Render document tables cleanly
+  for (const table of tables) {
+    if (table.length === 0) continue;
+    cursorY -= 8;
+    const colCount = Math.max(1, ...table.map((r) => r.length));
+    const colW = contentW / colCount;
+    const rowH = 20;
+
+    for (let rIdx = 0; rIdx < table.length; rIdx++) {
+      ensureSpace(rowH + 2);
+      const isHeader = rIdx === 0 && table.length > 1;
+      page.drawRectangle({
+        x: margin,
+        y: cursorY - rowH,
+        width: contentW,
+        height: rowH,
+        color: isHeader
+          ? rgb(0.12, 0.16, 0.23)
+          : rIdx % 2 === 1
+            ? rgb(0.97, 0.98, 0.99)
+            : rgb(1, 1, 1),
+        borderColor: rgb(0.84, 0.87, 0.91),
+        borderWidth: 0.5,
+      });
+
+      for (let cIdx = 0; cIdx < colCount; cIdx++) {
+        const font = isHeader ? boldFont : regularFont;
+        const val = clipTextToWidth(table[rIdx][cIdx] ?? '', font, 9, Math.max(14, colW - 8));
+        page.drawText(val, {
+          x: margin + cIdx * colW + 4,
+          y: cursorY - rowH + 6,
+          size: 9,
+          font,
+          color: isHeader ? rgb(1, 1, 1) : rgb(0.12, 0.16, 0.23),
+        });
+      }
+      cursorY -= rowH;
+    }
+    cursorY -= 10;
+  }
+
+  const outBytes = await pdfDoc.save({ useObjectStreams: true });
+  onProgress?.(100);
+  const blob = new Blob([outBytes.buffer.slice(outBytes.byteOffset, outBytes.byteOffset + outBytes.byteLength) as ArrayBuffer], {
+    type: 'application/pdf',
+  });
+  return makeResult(blob, `${baseName}.pdf`, {
+    originalBytes: file.size,
+    pageCount: pdfDoc.getPageCount(),
+    summary: `Converted ${label} document into a ${pdfDoc.getPageCount()}-page vector PDF${
+      tables.length > 0 ? ` (${tables.length} table(s) formatted)` : ''
+    }.`,
+  });
+}
+
+/** Converts modern Word (.docx, .docm, .dotx) files into vector PDF preserving headings, bullets, and tables. */
+export async function enhancedDocxToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(8);
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const docXmlFile = zip.file('word/document.xml');
+  if (!docXmlFile) {
+    throw new Error(`Could not find word/document.xml inside "${file.name}".`);
+  }
+  const { blocks, tables } = parseEnhancedDocxXml(await docXmlFile.async('string'));
+  return renderDocumentBlocksAndTablesToPdf(blocks, tables, file, 'Word (.docx)', onProgress);
+}
+
+/** Converts OpenDocument Text (.odt) files into vector PDF. */
+export async function odtToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(8);
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const contentFile = zip.file('content.xml');
+  if (!contentFile) {
+    throw new Error('Could not find content.xml inside this .odt document.');
+  }
+  const { blocks, tables } = parseOdtContentXml(await contentFile.async('string'));
+  return renderDocumentBlocksAndTablesToPdf(blocks, tables, file, 'OpenDocument (.odt)', onProgress);
+}
+
+/** Converts legacy Word 97–2003 (.doc) files (OLE2, RTF-disguised, or HTML-disguised) into PDF. */
+export async function legacyDocToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(10);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const blocks = extractBlocksFromLegacyDoc(bytes);
+  return renderDocumentBlocksAndTablesToPdf(blocks, [], file, 'Word (.doc)', onProgress);
+}
+
+/** Converts Rich Text Format (.rtf) files into vector PDF. */
+export async function rtfToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(10);
+  const text = await file.text();
+  const blocks = parseRtfToBlocks(text);
+  return renderDocumentBlocksAndTablesToPdf(blocks, [], file, 'Rich Text (.rtf)', onProgress);
+}
+
+/** Converts E-Book (.epub) chapters into a clean multi-page vector PDF. */
+export async function epubToPdf(
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<ToolResult> {
+  onProgress?.(8);
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const chapterPaths: string[] = [];
+
+  // Attempt OPF spine ordering first
+  let opfPath: string | null = null;
+  const containerFile = zip.file('META-INF/container.xml');
+  if (containerFile) {
+    const containerXml = await containerFile.async('string');
+    const rf = /full-path="([^"]+)"/i.exec(containerXml);
+    if (rf) opfPath = rf[1];
+  }
+  if (opfPath && zip.file(opfPath)) {
+    const opfXml = await zip.file(opfPath)!.async('string');
+    const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
+    const manifest = new Map<string, string>();
+    const itemRe = /<item\b[^>]*>/gi;
+    let im: RegExpExecArray | null;
+    while ((im = itemRe.exec(opfXml)) !== null) {
+      const id = /\bid="([^"]+)"/.exec(im[0])?.[1];
+      const href = /\bhref="([^"]+)"/.exec(im[0])?.[1];
+      if (id && href) manifest.set(id, href);
+    }
+    const itemrefRe = /<itemref\b[^>]*idref="([^"]+)"/gi;
+    let rm: RegExpExecArray | null;
+    while ((rm = itemrefRe.exec(opfXml)) !== null) {
+      const href = manifest.get(rm[1]);
+      if (href) {
+        const full = resolveZipTargetPath(opfDir, href);
+        if (zip.file(full)) chapterPaths.push(full);
+      }
+    }
+  }
+
+  // Fallback: discover .xhtml/.html files in zip
+  if (chapterPaths.length === 0) {
+    zip.forEach((relPath, entry) => {
+      if (!entry.dir && /\.(xhtml|html|htm)$/i.test(relPath) && !/toc|nav/i.test(relPath)) {
+        chapterPaths.push(relPath);
+      }
+    });
+    chapterPaths.sort();
+  }
+
+  const allBlocks: StructuredTextBlock[] = [];
+  for (let i = 0; i < chapterPaths.length; i++) {
+    const html = await zip.file(chapterPaths[i])!.async('string');
+    const chapterBlocks = stripHtmlToBlocks(html);
+    if (chapterBlocks.length > 0) {
+      if (allBlocks.length > 0) allBlocks.push({ type: 'divider', text: '' });
+      allBlocks.push(...chapterBlocks);
+    }
+    onProgress?.(10 + Math.round(((i + 1) / Math.max(1, chapterPaths.length)) * 40));
+  }
+
+  return renderDocumentBlocksAndTablesToPdf(allBlocks, [], file, 'EPUB (.epub)', onProgress);
+}
+

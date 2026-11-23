@@ -83,11 +83,13 @@ export const TOOLS_CATALOG: ToolDefinition[] = [
     name: 'PDF Converter',
     shortName: 'Converter',
     category: 'convert',
-    description: 'Convert between PDF and Word (.docx), PowerPoint (.pptx), Sheets (.xlsx/.ods/.csv), HTML, Markdown, or images.',
+    description:
+      'Convert between PDF and Word (.doc/.docx/.odt/.rtf), Slides (.ppt/.pptx/.odp), Sheets (.xls/.xlsx/.ods/.csv), EPUB, HTML, Markdown, or images.',
     capability: 'workaround',
     capabilityNote:
-      'Client-side converter: Supports bidirectional PDF ↔ Word (.docx), PowerPoint (.pptx — editable text or exact visual slides), Excel/Sheets (.xlsx, .ods, .csv, .tsv), Markdown, HTML, TXT, and images 100% locally. Complex slide animations, SmartArt, and live Excel macros/formulas require desktop Office or LibreOffice.',
-    accept: '.pdf,.docx,.pptx,.xlsx,.ods,.csv,.tsv,.txt,.md,.html,.htm,.png,.jpg,.jpeg,.webp',
+      'Client-side converter: Supports Slides (.ppt, .pptx, .pptm, .ppsx, .potx, .odp), Docs (.doc, .docx, .docm, .dotx, .odt, .rtf, .epub), Sheets (.xls, .xlsx, .xlsm, .xltx, .ods, .csv, .tsv), Web/Text (.html, .md, .txt, .json, .xml), and Images (.png, .jpg, .webp, .gif, .bmp, .svg) 100% locally. Legacy binary .ppt/.doc/.xls extract text/tables cleanly (complex animations, SmartArt, and live macros still require desktop Office).',
+    accept:
+      '.pdf,.doc,.docx,.docm,.dotx,.odt,.rtf,.epub,.ppt,.pptx,.pptm,.ppsx,.potx,.odp,.xls,.xlsx,.xlsm,.xltx,.ods,.csv,.tsv,.txt,.md,.markdown,.log,.json,.xml,.yaml,.yml,.html,.htm,.xhtml,.mht,.mhtml,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg,.avif',
     multiple: true,
     expectedKind: 'converter',
     memoryMultiplier: 4.5,
